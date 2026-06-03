@@ -1,0 +1,21 @@
+services:
+  backend:
+    build: ./backend
+    ports:
+      - "${BACKEND_PORT}:8000"
+    env_file:
+      - .env
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ./frontend
+      args:
+        NEXT_PUBLIC_API_URL: http://${HOST}:${BACKEND_PORT}
+    ports:
+      - "${FRONTEND_PORT}:3000"
+    env_file:
+      - .env
+    depends_on:
+      - backend
+    restart: unless-stopped
