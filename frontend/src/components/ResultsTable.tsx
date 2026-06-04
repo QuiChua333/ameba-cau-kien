@@ -201,9 +201,15 @@ export function ResultsTable({ data, pdfFile }: ResultsTableProps) {
     // Separate foundations and beams
     const foundations = foundation_list.filter(item => item.classification !== "FW/FG");
     const beams = foundation_list.filter(item => item.classification === "FW/FG");
-    const regularFloors = data.floor_regular_list || [];
-    const slopedFloors = data.floor_sloped_list || [];
-    const hasFloorData = !!(data.floor_overview_base64 || regularFloors.length || slopedFloors.length);
+    // GL markers — listed flat (no regular/sloped floor distinction).
+    const glMarkers = data.oval_gl_list || [];
+    const glMarkerGroups = Object.entries(
+        glMarkers.reduce<Record<string, number>>((acc, m) => {
+            acc[m.text] = (acc[m.text] || 0) + 1;
+            return acc;
+        }, {})
+    ).map(([text, count]) => ({ text, count }));
+    const hasFloorData = !!(data.floor_overview_base64 || glMarkers.length);
     const canDownloadExcel = !!data.excel_ready && foundation_list.length > 0;
     const pitList: PitHoleItem[] = data.pit_list ?? [];
 
@@ -567,44 +573,26 @@ export function ResultsTable({ data, pdfFile }: ResultsTableProps) {
             <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 space-y-6">
                 <div className="flex items-center gap-3">
                     <div className="h-8 w-1 bg-teal-500 rounded-full"></div>
-                    <h2 className="text-2xl font-bold text-gray-900">Phát hiện sàn</h2>
+                    <h2 className="text-2xl font-bold text-gray-900">Ký hiệu GL</h2>
                     <span className="text-sm text-gray-500 bg-gray-100 px-3 py-1 rounded-full">
-                        {regularFloors.length + slopedFloors.length} loại
+                        {glMarkers.length} marker
                     </span>
                 </div>
 
                 <div className="grid grid-cols-1 lg:grid-cols-[1.3fr_0.9fr] gap-6">
                     <div className="bg-white rounded-xl border border-gray-200 p-6 shadow-sm space-y-4">
-                        <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
-                            <StatCard label="GL Marker" value={data.oval_gl_list?.length || 0} />
-                            <StatCard label="Sàn Phẳng" value={regularFloors.length} />
-                            <StatCard label="Sàn Dốc" value={slopedFloors.length} />
+                        <div className="grid grid-cols-2 gap-3">
+                            <StatCard label="GL Marker" value={glMarkers.length} />
                             <StatCard label="Slab" value={data.slab_list?.length || 0} />
                         </div>
 
-                        {regularFloors.length > 0 && (
+                        {glMarkerGroups.length > 0 && (
                             <div className="space-y-3">
-                                <h3 className="text-sm font-semibold text-gray-900">Sàn phẳng</h3>
+                                <h3 className="text-sm font-semibold text-gray-900">Danh sách marker</h3>
                                 <div className="flex flex-wrap gap-2">
-                                    {regularFloors.map((floor) => (
-                                        <Badge key={floor.elevation} className="bg-teal-50 text-teal-700 border-teal-200">
-                                            {floor.elevation} • {floor.count} marker
-                                        </Badge>
-                                    ))}
-                                </div>
-                            </div>
-                        )}
-
-                        {slopedFloors.length > 0 && (
-                            <div className="space-y-3">
-                                <h3 className="text-sm font-semibold text-gray-900">Sàn dốc</h3>
-                                <div className="flex flex-wrap gap-2">
-                                    {slopedFloors.map((floor) => (
-                                        <Badge
-                                            key={`${floor.start_elevation}:${floor.end_elevation}:${floor.region.page}:${floor.region.xmin}:${floor.region.ymin}`}
-                                            className="bg-orange-50 text-orange-700 border-orange-200"
-                                        >
-                                            {floor.start_elevation} → {floor.end_elevation}
+                                    {glMarkerGroups.map((m) => (
+                                        <Badge key={m.text} className="bg-teal-50 text-teal-700 border-teal-200">
+                                            {m.text}{m.count > 1 ? ` • ${m.count}` : ""}
                                         </Badge>
                                     ))}
                                 </div>
@@ -613,7 +601,7 @@ export function ResultsTable({ data, pdfFile }: ResultsTableProps) {
 
                         {!data.floor_overview_base64 && data.is_partial && (
                             <p className="text-sm text-gray-500">
-                                Dữ liệu GL/sàn đã về trước. Ảnh tổng quan sẽ xuất hiện sau khi backend xử lý crop xong.
+                                Dữ liệu GL đã về trước. Ảnh tổng quan sẽ xuất hiện sau khi backend xử lý crop xong.
                             </p>
                         )}
                     </div>

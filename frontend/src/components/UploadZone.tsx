@@ -102,23 +102,21 @@ export function UploadZone({ onExtractionComplete, onFileName, onFileSelect, onR
                     case "gemini_progress":
                         setPhase(`Gemini đang trả dữ liệu... chunk ${eventPayload.chunk_index || 0}, ${eventPayload.chars_received || 0} ký tự`);
                         break;
+                    // Intermediate events update the loading text ONLY — results are
+                    // rendered once, on "complete", so the user sees a single finished
+                    // view instead of progressive partial updates.
                     case "stream_patch":
                         if (eventPayload.foundation_list?.length) {
                             setPhase(`Đang cập nhật thêm ${eventPayload.foundation_list.length} cấu kiện từ Gemini...`);
                         } else if (eventPayload.oval_gl_list?.length || eventPayload.floor_regular_list?.length) {
                             setPhase("Đang cập nhật thêm dữ liệu sàn/GL...");
                         }
-                        onExtractionComplete(eventPayload as StreamPatchPayload);
                         break;
                     case "partial_table_data":
-                        setPhase("Đã đọc được bảng móng từ PDF, đang hiển thị dữ liệu tạm...");
-                        onExtractionComplete(eventPayload as ExtractionResponse);
+                        setPhase("Đã đọc được bảng móng từ PDF, đang xử lý tiếp...");
                         break;
                     case "partial_data":
-                        // Excel-ready data — render the table immediately.
-                        // Images haven't been cropped yet so they may be missing.
-                        setPhase("Đang trích xuất ảnh móng...");
-                        onExtractionComplete(eventPayload as ExtractionResponse);
+                        setPhase("Đang hoàn tất dữ liệu...");
                         break;
                     case "complete":
                         setPhase("Hoàn tất");

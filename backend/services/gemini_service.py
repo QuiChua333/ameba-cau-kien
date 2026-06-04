@@ -48,6 +48,7 @@ from services.text_parser import (
     resolve_elevations_for_list,
     split_combined_types,
     sanitize_fields,
+    parse_pit_elevations,
 )
 from services.table_extractor import TableExtractionResult
 from services.textlayer_phase1 import TextLayerScanResult, scan_text_layer
@@ -749,28 +750,32 @@ FOR EACH PIT DRAWING FOUND, EXTRACT:
    - Numbers labeled "D" = slab body thickness → NOT top_elevation.
    - Horizontal numbers (step widths, wall thicknesses, channel widths) → NOT top_elevation.
    - If the only vertical GL-to-floor link is ※ → readable=false (regardless of size).
-   - ⚠️ MULTIPLE PARALLEL VERTICAL DIMENSIONS (NESTED CHAINS): when two or more
-     vertical dimension lines run side by side on the SAME side (e.g. an inner
-     "1,400" and an OUTER "1,495"), pick the OUTERMOST one whose TOP endpoint
-     touches the ▽GL line. top_elevation is ALWAYS measured FROM ▽GL, so it is
-     the LARGER value. The inner/shorter chain begins at a LOWER datum (the top
-     of the surrounding slab, which already sits below ▽GL) and is NOT the
-     GL-to-floor depth.
-     ⛔ Do NOT pick the smaller inner dimension (e.g. 1,400) when a larger outer
-        dimension (e.g. 1,495) extends all the way up to the ▽GL line.
+   - ⚠️ TWO ENDPOINTS define top_elevation — get BOTH right (do NOT just take the
+     largest number when several vertical dimensions are stacked side by side):
+       • TOP endpoint  = the ▽GL line (measure FROM ▽GL, never from a lower datum).
+       • BOTTOM endpoint = the TOP surface of the bottom slab (where the fill/soil
+         meets the top of the concrete) — NOT the slab's underside.
+     Two common traps:
+       (a) An inner chain may START below ▽GL (at a step/slab top). Ignore it; use
+           the chain whose top touches ▽GL.   e.g. inner 1,400 vs 1,495-from-▽GL → 1,495.
+       (b) A dimension may run PAST the slab top down to the slab UNDERSIDE, i.e. it
+           equals (depth-to-slab-top + slab thickness D). That is NOT top_elevation.
+           e.g. 1,000 to the slab top vs 1,200 to the slab bottom (D=200) → use 1,000.
+     ⛔ Pick the dimension running from ▽GL to the slab TOP — not the largest, not the
+        one to the slab bottom, not one starting below ▽GL.
    - top_elevation can be any value (100mm, 300mm, 1,000mm, etc.) — there is no minimum threshold.
 
 3. D: Thickness of the pit floor slab.
-   - D = the vertical dimension spanning the concrete body of the pit floor (top to bottom).
-   - Same reading method as foundation D: the dimension labeled with a bracket inside the concrete zone.
-   - Typical range: 150–300mm. If the value you read exceeds 400mm, re-check — you are likely
+   - D sits in the SAME vertical dimension chain as top_elevation, IMMEDIATELY BELOW it:
+     top_elevation = ▽GL → slab top, and the very next segment down (slab top → slab
+     bottom) IS D. So read D right next to / just below where you measured ▽GL.
+   - ⛔ Do NOT read D from a different part of the drawing — a step/段 dimension, the
+     土間コンクリート thickness, or any horizontal width. e.g. if a "150" step appears on
+     the far side but the slab in the ▽GL chain is "200", D = 200 (NOT 150).
+   - Exclude the leveling concrete (捨てコンクリート t=50) beneath the slab.
+   - Typical range: 150–300mm. If the value exceeds 400mm, re-check — you are likely
      reading a foundation (F-type) slab or beam dimension, not the pit slab.
-   - ⚠️ STEPPED PIT: read D for the floor slab on the SAME side you used for
-     top_elevation (the explicit, readable side). The slab thickness is the small
-     vertical dimension (often ~180mm) bracketing the concrete just below that
-     floor level — NOT the leveling concrete (捨てコンクリート t=50) beneath it.
-     A "180" bracket on the readable floor slab IS a valid D; do NOT return null
-     just because the drawing is busy or the deeper step is marked ※.
+   - Do NOT return null just because the drawing is busy or a deeper step is marked ※.
    - If readable=false or dimension is genuinely unclear, set D=null.
 
    ━━━ CRITICAL — STAY INSIDE THE PIT'S BORDERED CELL ━━━
@@ -907,15 +912,16 @@ Example G — TWO DRAWINGS IN ONE BORDERED RECTANGLE:
 ⛔ WRONG: Creating two separate "水盤ピット" entries for the left and right views.
 ✅ RIGHT: One entry for "水盤ピット" using dimensions from the primary view.
 
-Example H — NESTED PARALLEL DIMENSIONS (pick the one that reaches ▽GL):
-  Drawing title: "消火水槽詳細図 S=1/50" (stepped pit, left/deeper zone marked ※)
-  Right side shows TWO vertical dimensions running side by side:
-    Inner chain : 1,400  ← starts at the top of the slab (already below ▽SGL)
-    Outer chain : 1,495  ← top endpoint touches the ▽SGL line, down to pit floor
-  top_elevation is measured FROM ▽GL, so use the OUTER 1,495 (reaches ▽SGL).
-  → type="消火水槽", readable=true, top_elevation=-1495
-  ⛔ WRONG: top_elevation=-1400 (inner chain, starts below ▽SGL — not GL-to-floor).
-  ✅ RIGHT: top_elevation=-1495 (outer chain reaches the ▽SGL line).
+Example H — top_elevation runs from ▽GL to the SLAB TOP (two traps):
+  TRAP A — an inner chain starts BELOW ▽GL:
+    Two side-by-side verticals: inner 1,400 (starts at a step/slab top, below ▽GL)
+    and outer 1,495 (from ▽GL down to the floor top). Use the one starting at ▽GL.
+    → top_elevation = -1495   (NOT -1400)
+  TRAP B — a dimension runs to the slab UNDERSIDE:
+    A "1,000" vertical from ▽GL to the TOP of the bottom slab, and a "1,200" that
+    continues to the slab BOTTOM (1,000 + 200 slab thickness D).
+    → top_elevation = -1000   (NOT -1200; 1,200 = slab-top depth + D)
+  ⛔ Never just pick the largest number — pick the one from ▽GL to the slab TOP.
 
 Extract the following information for each item:
 1. Type (基礎符号)
@@ -1421,21 +1427,31 @@ Read TWO values FROM THIS DRAWING ONLY (ignore anything outside its border):
 1) top_elevation — the vertical distance from the ▽GL (or ▽SGL) line straight DOWN
    to the TOP surface of the pit floor slab, in mm, returned as a NEGATIVE integer.
 
-   ⚠️ CRITICAL — NESTED PARALLEL VERTICAL DIMENSIONS:
-   The right side often shows TWO vertical dimension lines running side by side,
-   e.g. an INNER "1,400" and an OUTER "1,495". top_elevation is measured FROM the
-   ▽GL line, so pick the OUTERMOST dimension whose TOP endpoint touches ▽GL — the
-   LARGER value. The inner/shorter dimension begins at a LOWER datum (the top of the
-   surrounding slab, which already sits below ▽GL) and is NOT the GL-to-floor depth.
-   ✅ 1,400 (inner) + 1,495 (outer reaching ▽GL)  → top_elevation = -1495
-   ⛔ NEVER pick the smaller inner value (-1400) when a larger outer value reaches ▽GL.
+   ⚠️ CRITICAL — measure from ▽GL to the SLAB TOP (do NOT just take the largest
+   number when several vertical dimensions are stacked):
+     • TOP endpoint  = the ▽GL line (measure FROM ▽GL, not from a lower datum).
+     • BOTTOM endpoint = the TOP surface of the bottom slab (where the fill meets the
+       top of the concrete) — NOT the slab's underside.
+   Two traps:
+     (a) An inner chain may START below ▽GL (at a step/slab top); ignore it and use
+         the one whose top touches ▽GL.   e.g. inner 1,400 vs 1,495-from-▽GL → -1495.
+     (b) A dimension may run PAST the slab top down to the slab UNDERSIDE, i.e. it
+         equals (depth-to-slab-top + slab thickness D). That is NOT top_elevation.
+         e.g. 1,000 to the slab top vs 1,200 to the slab bottom (D=200) → -1000, NOT -1200.
+   ⛔ Pick the dimension from ▽GL to the slab TOP — not the largest, not to the slab bottom.
 
    STEPPED PIT (deeper zone marked ※ on one side): use the explicit readable floor
    side (no ※), still applying the outer-chain rule above.
 
-2) D — thickness of the pit floor slab on that same readable side: the small bracket
-   (~150–300mm, often 180) spanning the concrete body, NOT the 捨てコンクリート
-   (t=50) leveling layer beneath it, and NOT any horizontal width.
+2) D — thickness of the pit floor slab. Read it in the SAME vertical dimension chain
+   you used for top_elevation, IMMEDIATELY BELOW it: the top_elevation segment runs
+   ▽GL → slab top; the very next segment down (slab top → slab bottom) IS D. So D sits
+   right next to / just below where you measured ▽GL, on the same side.
+   ⛔ Do NOT read D from a different part of the drawing (a step/段 dimension, the 土間
+      コンクリート thickness, or a horizontal width). e.g. if a "150" step appears on the
+      far side but the slab in the ▽GL chain is "200", D = 200 (NOT 150).
+   ⛔ Exclude the 捨てコンクリート (t=50) leveling layer beneath the slab.
+   Typical 150–300mm.
 
 If a value genuinely cannot be read, set it to 0. Set readable=false only when the
 vertical GL-to-floor dimension is marked ※ or the floor is at/above ▽GL.
@@ -1961,6 +1977,34 @@ def _normalize_pit_type(t: str) -> str:
     return norm
 
 
+def _apply_pit_text_elevations(pit_list: list, elev_map: dict) -> list:
+    """Merge floor-plan text-layer pit elevations into the pit list.
+
+    For each pit named in `elev_map` (from "…詳細図参照(底盤天端…GL-XXX)"): set its
+    top_elevation — authoritative, since 底盤天端 IS the slab-top elevation — and
+    mark readable=True. Pits that Gemini missed entirely are appended as new
+    entries (D filled later by the second pass / left null). Idempotent: safe to
+    call before the pit second pass (to detect/seed) and again after it (to
+    re-assert the authoritative value over any vision re-read).
+    """
+    by_norm = {_normalize_pit_type(p.type): p for p in pit_list}
+    for name, elev in elev_map.items():
+        key = _normalize_pit_type(name)
+        existing = by_norm.get(key)
+        if existing is not None:
+            existing.top_elevation = float(elev)
+            existing.readable = True
+        else:
+            new_pit = PitHoleItem(
+                type=name, top_elevation=float(elev), D=None,
+                readable=True, region=None, image_base64=None,
+            )
+            pit_list.append(new_pit)
+            by_norm[key] = new_pit
+            print(f"[PitText] added pit '{name}' (GL{elev:+.0f}) missing from vision pass")
+    return pit_list
+
+
 def _deduplicate_pits(pit_list: list) -> list:
     """Collapse duplicate pit entries that share the same type name.
 
@@ -2316,6 +2360,16 @@ def extract_data_from_images(images: List[Image.Image], pdf_text: str = "",
     if parsed_response.pit_list:
         parsed_response.pit_list = _deduplicate_pits(parsed_response.pit_list)
 
+    # ── Pit detection + authoritative elevation from the floor-plan text layer ──
+    # "…詳細図参照(底盤天端…GL-XXX)" gives the exact slab-top elevation and reliably
+    # surfaces pits the vision pass missed. Run BEFORE the Phase-2 pool so the
+    # text-layer region locator and second pass include any pit added here.
+    pit_elev_map = parse_pit_elevations(pdf_text) if pdf_text else {}
+    if pit_elev_map:
+        parsed_response.pit_list = _apply_pit_text_elevations(
+            parsed_response.pit_list, pit_elev_map
+        )
+
     # ── Text-layer locator (fast, deterministic, no API) ────────────────────
     text_layer_summary: dict = {}
     if parsed_response.foundation_list and (pdf_bytes or text_layer_scan.page_scans):
@@ -2362,12 +2416,32 @@ def extract_data_from_images(images: List[Image.Image], pdf_text: str = "",
             overlap_futures["table"] = pool.submit(
                 _crop_table_image, parsed_response.table_region, images
             )
-        # Pit drawing locator (text layer) — independent of Gemini results.
+        # Pit drawing locator (text layer) + focused high-res re-read.
+        # Both depend only on pdf_bytes + pit type names — NOT on the beam pass,
+        # the plumber merge, or any crop — so run the whole pit Gemini round-trip
+        # concurrently with the beam pass instead of serially after the pool.
+        # (_gemini_sem still caps total concurrent Gemini calls.)
+        def _pit_locate_and_reread():
+            applied = 0
+            try:
+                regions = find_pit_drawing_regions(
+                    pdf_bytes, [p.type for p in parsed_response.pit_list]
+                )
+                for p in parsed_response.pit_list:
+                    r = regions.get(p.type)
+                    if r:
+                        p.region = r
+                        applied += 1
+                print(f"[PitLocator] located {applied} / {len(parsed_response.pit_list)} pit drawing(s) from text layer")
+            except Exception as e:
+                print(f"[PitLocator] failed: {e}")
+            # Focused high-res re-read now that regions are set (only processes
+            # pits whose region was located above).
+            _run_pit_second_pass(parsed_response.pit_list, images)
+            return applied
+
         if parsed_response.pit_list and pdf_bytes:
-            overlap_futures["pit_regions"] = pool.submit(
-                find_pit_drawing_regions,
-                pdf_bytes, [p.type for p in parsed_response.pit_list],
-            )
+            overlap_futures["pit_pass"] = pool.submit(_pit_locate_and_reread)
 
         # Wait for the beam pass first — downstream merging needs its results.
         if "beam_pass" in overlap_futures:
@@ -2461,25 +2535,19 @@ def extract_data_from_images(images: List[Image.Image], pdf_text: str = "",
 
     # ── Pit hole image crops ──────────────────────────────────────────────────
     if parsed_response.pit_list:
-        # Apply text-layer pit regions computed in the Phase 2 pool. Gemini's pit
-        # bounding boxes are unreliable, so the text-layer caption region is
-        # authoritative whenever found (anchored on "…詳細図 S=…", not the
-        # floor-plan "…詳細図参照" reference label).
-        if "pit_regions" in overlap_futures:
+        # Text-layer region location + focused high-res re-read already ran
+        # concurrently with the beam pass inside the Phase 2 pool
+        # (_pit_locate_and_reread). Drain it here to surface any exception; the
+        # pool's exit already joined it, so result() returns immediately.
+        if "pit_pass" in overlap_futures:
             try:
-                pit_regions = overlap_futures["pit_regions"].result()
-                applied = 0
-                for p in parsed_response.pit_list:
-                    r = pit_regions.get(p.type)
-                    if r:
-                        p.region = r
-                        applied += 1
-                print(f"[PitLocator] located {applied} / {len(parsed_response.pit_list)} pit drawing(s) from text layer")
+                overlap_futures["pit_pass"].result()
             except Exception as e:
-                print(f"[PitLocator] failed: {e}")
-        # Focused high-res re-read of top_elevation / D now that regions are set
-        # (fixes nested-dimension misreads like 1,400 vs 1,495 on the first pass).
-        _run_pit_second_pass(parsed_response.pit_list, images)
+                print(f"[PitPass] pit locate/re-read failed: {e}")
+        # Re-assert floor-plan text-layer elevations AFTER the vision second pass:
+        # 底盤天端 is authoritative, so it overrides any vision top_elevation.
+        if pit_elev_map:
+            _apply_pit_text_elevations(parsed_response.pit_list, pit_elev_map)
         _crop_pit_images(parsed_response.pit_list, images)
         print(f"[PitCrop] Cropped {sum(1 for p in parsed_response.pit_list if p.image_base64)} / {len(parsed_response.pit_list)} pit image(s)")
 

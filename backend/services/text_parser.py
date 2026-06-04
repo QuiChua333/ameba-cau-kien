@@ -97,6 +97,42 @@ def parse_elevations(pdf_text: str) -> ElevationData:
     return data
 
 
+# Pit elevation from the floor-plan reference annotation. The 基礎伏図 labels each
+# pit with its slab-top elevation, e.g.:
+#   "消火水槽詳細図参照(底盤天端設計GL-1,000)"  → {"消火水槽": -1000}
+#   "EV2ピット詳細図参照(底盤天端SGL-1,150)"   → {"EV2ピット": -1150}
+#   "ES1ピット詳細図参照(底盤天端GL-1,250)"     → {"ES1ピット": -1250}
+# 底盤天端 = top surface of the bottom slab = exactly the pit top_elevation, so this
+# is authoritative and removes the vision guesswork (1,000 vs 1,200 vs 1,495).
+_PIT_REF_RE = re.compile(
+    r'([0-9A-Za-z①-⑳、,]*[一-龥ァ-ヶー]+)詳細図参照\s*[（(]\s*'
+    r'底盤天端(?:設計)?S?GL[-－－]([0-9,，]+)',
+    re.UNICODE,
+)
+
+
+def parse_pit_elevations(pdf_text: str) -> dict:
+    """Extract {pit_type: top_elevation} from floor-plan '…詳細図参照(底盤天端…GL-XXX)'.
+
+    Returns a dict of pit name → negative mm. Leading numeric noise from an
+    adjacent annotation (e.g. "...GL-1,000消火水槽") is stripped from the name.
+    """
+    result: dict = {}
+    for m in _PIT_REF_RE.finditer(pdf_text):
+        # The capture may include preceding noise from an adjacent annotation
+        # ("…F27FW1…消火水槽"). The real pit name is the trailing Japanese run plus
+        # any latin/number prefix glued directly to it (e.g. "EV2" in "EV2ピット").
+        m2 = re.search(r'([A-Za-z]{1,4}\d{0,2})?([一-龥ァ-ヶー]+)$', m.group(1))
+        if not m2:
+            continue
+        name = (m2.group(1) or "") + m2.group(2)
+        num = int(m.group(2).replace(',', '').replace('，', ''))
+        result.setdefault(name, -num)
+    if result:
+        print(f"[PitText] floor-plan pit elevations: {result}")
+    return result
+
+
 # Combined-type splitter — a single F-code token (F11, F23A, F132 …)
 _FCODE_RE = re.compile(r'^F\d+[A-Za-z0-9]*$')
 
@@ -184,7 +220,9 @@ def sanitize_fields(foundation_list: list) -> list:
     """
     for item in foundation_list:
         d = re.sub(r'\s*▽.*$', '', str(item.dimensions.D), flags=re.DOTALL).strip()
-        if d and d != item.dimensions.D:
+        # Drop a rebar spec merged into D ("1000 18-D16" → "1000") and the ▽ leak.
+        d = re.sub(r'\s*\d+\s*-\s*D\d+(?:@[\d,]+)?.*$', '', d, flags=re.DOTALL).strip()
+        if d and d != str(item.dimensions.D):
             item.dimensions.D = d
 
         cleaned_remarks = _strip_drawing_text(item.remarks or "")

@@ -1,7 +1,13 @@
 import os
+from pathlib import Path
 from dotenv import load_dotenv
 
-load_dotenv()
+# Read env from the PROJECT-ROOT .env (one level above backend/), e.g.
+# d:\quihn\ameba1\source\.env — that's where GEMINI_MODEL_NAME / GOOGLE_API_KEY live.
+# Root takes precedence; a backend/.env (or cwd .env) only fills anything missing.
+_ROOT_ENV = Path(__file__).resolve().parent.parent / ".env"
+load_dotenv(_ROOT_ENV)
+load_dotenv(override=False)
 
 # Google Gemini API Key
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
@@ -11,6 +17,8 @@ if not GOOGLE_API_KEY:
     print("WARNING: GOOGLE_API_KEY environment variable not set.")
 
 # Model Configuration
-# Model Configuration
-# Using gemini-2.0-flash-lite-preview-02-05 for maximum speed (lowest latency)
-GEMINI_MODEL_NAME = "gemini-3.1-pro-preview"
+# Flash tier for speed (the pipeline is designed around Flash latency; the
+# foundation table, foundation/pit elevations are now extracted deterministically
+# from the text layer, so a faster vision model is low-risk).
+# Override in .env with GEMINI_MODEL_NAME=... to use a different model.
+GEMINI_MODEL_NAME = os.getenv("GEMINI_MODEL_NAME", "gemini-2.5-flash")

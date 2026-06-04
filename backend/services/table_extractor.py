@@ -192,12 +192,22 @@ def _extract_item_from_row(row: list, col_map: dict) -> "Optional[FoundationItem
 
     lx = _parse_number(get("lx")) or 0.0
     ly = _parse_number(get("ly")) or 0.0
-    d_str = _parse_d(get("d", "0"))
+    d_raw = get("d", "0")
+    d_str = _parse_d(d_raw)
 
     rebar_x = get("rebar_x")
     rebar_y = get("rebar_y")
     if rebar_x and not rebar_y:
         rebar_x, rebar_y = _split_rebar_combined(rebar_x)
+
+    # Recover a rebar spec that merged into the D cell when the word-grid collapsed
+    # the D and ベース筋(←) columns (e.g. D cell "1000~300 16-D16"). _parse_d strips
+    # the spec out of D, so put it back as rebar_x when the ← column is itself empty
+    # (the merge leaves the separate ← column blank for those rows).
+    if not _clean_rebar_spec(rebar_x):
+        d_rebar = _clean_rebar_spec(d_raw)
+        if d_rebar:
+            rebar_x = d_rebar
 
     remarks = get("remarks")
     remarks = re.sub(r'^\d+\s+', '', remarks).strip()
@@ -479,6 +489,10 @@ def _parse_d(text: Optional[str]) -> str:
     # Drop any ▽GL/▽SGL elevation annotation that leaked into the D cell
     # (e.g. "1050~300 ▽SGL 564" → "1050~300"). D never contains a ▽ marker.
     s = re.sub(r'▽.*$', '', s, flags=re.DOTALL).strip()
+    # Drop a rebar spec that merged into the D cell when the word-grid collapsed
+    # the D and ベース筋(←) columns into one (e.g. "1000 18-D16" → "1000",
+    # "1000~300 34-D13" → "1000~300"). D never contains an "N-Dnn" rebar spec.
+    s = re.sub(r'\s*\d+\s*-\s*D\d+(?:@[\d,]+)?.*$', '', s, flags=re.DOTALL).strip()
     if not s:
         return "0"
 
