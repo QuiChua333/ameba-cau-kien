@@ -43,7 +43,12 @@ from models import (
 # Text layer and table extraction (delegated to dedicated modules)
 # ─────────────────────────────────────────────────────────────────────────────
 
-from services.text_parser import parse_elevations, resolve_elevations_for_list
+from services.text_parser import (
+    parse_elevations,
+    resolve_elevations_for_list,
+    split_combined_types,
+    sanitize_fields,
+)
 from services.table_extractor import TableExtractionResult
 from services.textlayer_phase1 import TextLayerScanResult, scan_text_layer
 from services.drawing_locator import (
@@ -95,15 +100,18 @@ PRE-STEP 4A: SCAN FOUNDATION FLOOR PLAN FOR EXPLICIT ANNOTATIONS (HIGHEST PRIORI
 The 基礎伏図 (Foundation Floor Plan) is THE MOST RELIABLE source for top_elevation.
 ALWAYS scan it before reading any cross-section drawing.
 
-1) Find the floor plan note (either format is valid):
+1) Find the floor plan note (any format is valid):
      "基礎符号(設計GL-***)の(　)内数値は、基礎天端高さを示す"
      "基礎符号(GL-***)の(　)内数値は、基礎天端高さを示す"
-   This confirms that the "(GL-XXX)" or "(設計GL-XXX)" value next to each foundation
-   symbol = the foundation SLAB TOP elevation (底盤天端高さ).
+     "基礎符号(SGL-***)の(　)内数値は、基礎天端高さを示す"
+   ⚠️ The GL prefix varies by project. Accept ANY of: GL, SGL, 設計GL, 設計SGL.
+   Pattern: ▽*GL where * can be nothing, S, 設計, or 設計S.
+   This confirms that the "(*GL-XXX)" value next to each foundation symbol
+   = the foundation SLAB TOP elevation (底盤天端高さ).
 
 2) Collect ALL explicit per-foundation annotations from the floor plan.
-   These appear as "(GL-XXX)" or "(設計GL-XXX)" immediately after the foundation code.
-   BOTH formats are valid — the "設計" prefix may or may not be present.
+   These appear as "(*GL-XXX)" immediately after the foundation code.
+   Accept any GL prefix variant (GL, SGL, 設計GL, 設計SGL).
    Examples:
      "F1(GL-1,000)"       → F1   top_elevation = -1,000
      "F2B(GL-1,250)"      → F2B  top_elevation = -1,250
@@ -111,11 +119,16 @@ ALWAYS scan it before reading any cross-section drawing.
      "F1A(設計GL-450)"    → F1A  top_elevation = -450
      "F3(設計GL-1,250)"   → F3   top_elevation = -1,250
      "F2A(設計GL-1,700)"  → F2A  top_elevation = -1,700
+     "F15A(SGL-1,250)"    → F15A top_elevation = -1,250   ← SGL = 設計GL
+     "F115(SGL-1,150)"    → F115 top_elevation = -1,150
+     "F22B(SGL-1,250)"    → F22B top_elevation = -1,250
    These values are AUTHORITATIVE. Use them directly.
 
 3) Find the DEFAULT elevation note (used ONLY as a last resort):
      Format A: "特記無き基礎天端高さは、設計GL-250とする" → project default = -250
      Format B: "特記無き基礎天端高さは、GL−200とする"    → project default = -200
+     Format C: "特記無き基礎天端高さは、SGL-465とする"    → project default = -465
+   (Any *GL prefix variant is valid — GL, SGL, 設計GL, 設計SGL)
    ⚠️ Apply this default ONLY to foundations that have NO explicit annotation on the
    floor plan AND whose cross-section drawing cannot be found or read.
    If a foundation has an explicit floor plan annotation, ALWAYS use that, never the default.
@@ -194,7 +207,8 @@ These are side-view (cross-section) drawings showing the foundation in the groun
 
 ALGORITHM — follow exactly in this order:
 
-STEP A) Find the ▽GL horizontal line in the cross-section drawing.
+STEP A) Find the ▽GL (or ▽SGL — same meaning, SGL = 設計GL) horizontal line in the
+   cross-section drawing. Treat ▽SGL exactly as ▽GL.
 
 STEP B) On the LEFT side, find the dimension from ▽GL to the FOUNDATION SLAB TOP (底盤天端).
    The "foundation slab top" is the TOP SURFACE of the horizontal footing (底盤) at the
@@ -735,6 +749,15 @@ FOR EACH PIT DRAWING FOUND, EXTRACT:
    - Numbers labeled "D" = slab body thickness → NOT top_elevation.
    - Horizontal numbers (step widths, wall thicknesses, channel widths) → NOT top_elevation.
    - If the only vertical GL-to-floor link is ※ → readable=false (regardless of size).
+   - ⚠️ MULTIPLE PARALLEL VERTICAL DIMENSIONS (NESTED CHAINS): when two or more
+     vertical dimension lines run side by side on the SAME side (e.g. an inner
+     "1,400" and an OUTER "1,495"), pick the OUTERMOST one whose TOP endpoint
+     touches the ▽GL line. top_elevation is ALWAYS measured FROM ▽GL, so it is
+     the LARGER value. The inner/shorter chain begins at a LOWER datum (the top
+     of the surrounding slab, which already sits below ▽GL) and is NOT the
+     GL-to-floor depth.
+     ⛔ Do NOT pick the smaller inner dimension (e.g. 1,400) when a larger outer
+        dimension (e.g. 1,495) extends all the way up to the ▽GL line.
    - top_elevation can be any value (100mm, 300mm, 1,000mm, etc.) — there is no minimum threshold.
 
 3. D: Thickness of the pit floor slab.
@@ -742,7 +765,13 @@ FOR EACH PIT DRAWING FOUND, EXTRACT:
    - Same reading method as foundation D: the dimension labeled with a bracket inside the concrete zone.
    - Typical range: 150–300mm. If the value you read exceeds 400mm, re-check — you are likely
      reading a foundation (F-type) slab or beam dimension, not the pit slab.
-   - If readable=false or dimension is unclear, set D=null.
+   - ⚠️ STEPPED PIT: read D for the floor slab on the SAME side you used for
+     top_elevation (the explicit, readable side). The slab thickness is the small
+     vertical dimension (often ~180mm) bracketing the concrete just below that
+     floor level — NOT the leveling concrete (捨てコンクリート t=50) beneath it.
+     A "180" bracket on the readable floor slab IS a valid D; do NOT return null
+     just because the drawing is busy or the deeper step is marked ※.
+   - If readable=false or dimension is genuinely unclear, set D=null.
 
    ━━━ CRITICAL — STAY INSIDE THE PIT'S BORDERED CELL ━━━
    Detail sheets often place MULTIPLE drawing blocks on the same page:
@@ -877,6 +906,16 @@ Example G — TWO DRAWINGS IN ONE BORDERED RECTANGLE:
 
 ⛔ WRONG: Creating two separate "水盤ピット" entries for the left and right views.
 ✅ RIGHT: One entry for "水盤ピット" using dimensions from the primary view.
+
+Example H — NESTED PARALLEL DIMENSIONS (pick the one that reaches ▽GL):
+  Drawing title: "消火水槽詳細図 S=1/50" (stepped pit, left/deeper zone marked ※)
+  Right side shows TWO vertical dimensions running side by side:
+    Inner chain : 1,400  ← starts at the top of the slab (already below ▽SGL)
+    Outer chain : 1,495  ← top endpoint touches the ▽SGL line, down to pit floor
+  top_elevation is measured FROM ▽GL, so use the OUTER 1,495 (reaches ▽SGL).
+  → type="消火水槽", readable=true, top_elevation=-1495
+  ⛔ WRONG: top_elevation=-1400 (inner chain, starts below ▽SGL — not GL-to-floor).
+  ✅ RIGHT: top_elevation=-1495 (outer chain reaches the ▽SGL line).
 
 Extract the following information for each item:
 1. Type (基礎符号)
@@ -1363,6 +1402,125 @@ def _run_beam_page_second_pass(foundation_list: list, images: List[Image.Image])
         list(ex.map(lambda p: _process_page(*p), pages))
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Pit second pass — focused high-resolution re-read of top_elevation / D
+# ─────────────────────────────────────────────────────────────────────────────
+
+class _PitPassResult(_PydanticBase):
+    top_elevation: int  # negative mm (gap from ▽GL down to pit floor top); 0 if unreadable
+    D: int              # positive mm (pit floor slab thickness); 0 if unreadable
+    readable: bool
+
+
+PIT_SECOND_PASS_PROMPT = """
+You are reading ONE Japanese pit detail drawing (ピット詳細図), cropped from the
+sheet and enlarged. Pit type: {pit_type}
+
+Read TWO values FROM THIS DRAWING ONLY (ignore anything outside its border):
+
+1) top_elevation — the vertical distance from the ▽GL (or ▽SGL) line straight DOWN
+   to the TOP surface of the pit floor slab, in mm, returned as a NEGATIVE integer.
+
+   ⚠️ CRITICAL — NESTED PARALLEL VERTICAL DIMENSIONS:
+   The right side often shows TWO vertical dimension lines running side by side,
+   e.g. an INNER "1,400" and an OUTER "1,495". top_elevation is measured FROM the
+   ▽GL line, so pick the OUTERMOST dimension whose TOP endpoint touches ▽GL — the
+   LARGER value. The inner/shorter dimension begins at a LOWER datum (the top of the
+   surrounding slab, which already sits below ▽GL) and is NOT the GL-to-floor depth.
+   ✅ 1,400 (inner) + 1,495 (outer reaching ▽GL)  → top_elevation = -1495
+   ⛔ NEVER pick the smaller inner value (-1400) when a larger outer value reaches ▽GL.
+
+   STEPPED PIT (deeper zone marked ※ on one side): use the explicit readable floor
+   side (no ※), still applying the outer-chain rule above.
+
+2) D — thickness of the pit floor slab on that same readable side: the small bracket
+   (~150–300mm, often 180) spanning the concrete body, NOT the 捨てコンクリート
+   (t=50) leveling layer beneath it, and NOT any horizontal width.
+
+If a value genuinely cannot be read, set it to 0. Set readable=false only when the
+vertical GL-to-floor dimension is marked ※ or the floor is at/above ▽GL.
+
+Return JSON only, e.g.: {{"top_elevation": -1495, "D": 200, "readable": true}}
+"""
+
+
+def _crop_pit_area(region, page_image: Image.Image) -> Image.Image:
+    """Crop the pit cell generously so the full dimension chains (incl. the outer
+    vertical dimension on the right that reaches ▽GL) stay inside the image."""
+    w, h = page_image.size
+    x0 = (region.xmin / 1000) * w
+    x1 = (region.xmax / 1000) * w
+    y0 = (region.ymin / 1000) * h
+    y1 = (region.ymax / 1000) * h
+
+    pad_x = (x1 - x0) * 0.18 + 60
+    pad_y = (y1 - y0) * 0.18 + 60
+    left   = max(0, int(x0 - pad_x))
+    right  = min(w, int(x1 + pad_x))
+    top    = max(0, int(y0 - pad_y))
+    bottom = min(h, int(y1 + pad_y))
+
+    # Keep at least ~25% of the page in each dimension so a tight text-layer box
+    # never clips the outer dimension chain.
+    min_w, min_h = int(w * 0.25), int(h * 0.25)
+    if right - left < min_w:
+        cx = (left + right) // 2
+        left, right = max(0, cx - min_w // 2), min(w, cx + min_w // 2)
+    if bottom - top < min_h:
+        cy = (top + bottom) // 2
+        top, bottom = max(0, cy - min_h // 2), min(h, cy + min_h // 2)
+    return page_image.crop((left, top, right, bottom))
+
+
+def _run_pit_second_pass(pit_list: list, images: List[Image.Image]):
+    """Re-read each pit's top_elevation / D from a tight, high-resolution crop.
+
+    The first pass reads whole pages at low resolution, where two adjacent vertical
+    dimensions (e.g. 1,400 vs 1,495) are easy to confuse. This pass crops the pit
+    cell, enlarges it, and asks a focused question with the outer-chain rule, then
+    overrides the first-pass values when the re-read succeeds.
+    """
+    pits = [p for p in pit_list
+            if p.region and 0 <= (p.region.page - 1) < len(images)]
+    if not pits:
+        return
+
+    def _process(pit):
+        page_image = images[pit.region.page - 1]
+        send = _resize_for_api(_crop_pit_area(pit.region, page_image),
+                               max_long_side=1600)
+        prompt = PIT_SECOND_PASS_PROMPT.format(pit_type=pit.type)
+        try:
+            with _gemini_sem:
+                response = _get_gemini_client().models.generate_content(
+                    model=config.GEMINI_MODEL_NAME,
+                    contents=[prompt, send],
+                    config=types.GenerateContentConfig(
+                        temperature=0.0,
+                        response_mime_type="application/json",
+                        response_schema=_PitPassResult,
+                        thinking_config=types.ThinkingConfig(include_thoughts=False),
+                    ),
+                )
+            r = response.parsed
+            if not r:
+                return
+            if r.readable and r.top_elevation != 0:
+                old = pit.top_elevation
+                pit.top_elevation = float(r.top_elevation)
+                pit.readable = True
+                if old != pit.top_elevation:
+                    print(f"[PitPass] {pit.type}: top_elevation {old} → {pit.top_elevation}")
+            if r.D and r.D > 0:
+                pit.D = float(r.D)
+        except Exception as e:
+            print(f"[PitPass] Error for {pit.type}: {e}")
+
+    print(f"[PitPass] Re-reading {len(pits)} pit(s) at high resolution...")
+    with ThreadPoolExecutor(max_workers=max(1, min(4, len(pits)))) as ex:
+        list(ex.map(_process, pits))
+
+
 def _crop_table_image(table_region, images: List[Image.Image]) -> Optional[str]:
     """Crop and return base64 image of the foundation table."""
     if not table_region:
@@ -1687,6 +1845,12 @@ def _merge_with_plumber_data(gemini_list: list, plumber_list: list) -> list:
             # Keep Gemini's cross-section top_elevation when plumber has none
             if merged.top_elevation is None and g_item.top_elevation is not None:
                 merged.top_elevation = g_item.top_elevation
+            # Don't let pdfplumber's blank rebar erase a value Gemini read from the
+            # ベース筋 arrows column: prefer plumber, fall back to Gemini when blank.
+            if not (merged.rebar_x or "").strip() and (g_item.rebar_x or "").strip():
+                merged.rebar_x = g_item.rebar_x
+            if not (merged.rebar_y or "").strip() and (g_item.rebar_y or "").strip():
+                merged.rebar_y = g_item.rebar_y
             result.append(merged)
         else:
             result.append(plumber_item)
@@ -1778,6 +1942,62 @@ def _crop_foundation_row_images(foundation_list: list, images: List[Image.Image]
             buf = io.BytesIO()
             cropped.save(buf, format="JPEG", quality=90)
             item.image_base64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+
+
+def _normalize_pit_type(t: str) -> str:
+    """Normalize a pit type name for dedup comparison.
+
+    Upper-case, half-width, and strip spaces + comma variants so that
+    "ES1, ES2ピット" / "ES1、ES2ピット" / "ES1，ES2ピット" all compare equal.
+    """
+    s = (t or "").strip().upper()
+    out = []
+    for ch in s:
+        cp = ord(ch)
+        out.append(chr(cp - 0xFEE0) if 0xFF01 <= cp <= 0xFF5E else ch)
+    norm = "".join(out)
+    for sep in (" ", "　", ",", "、", "，"):
+        norm = norm.replace(sep, "")
+    return norm
+
+
+def _deduplicate_pits(pit_list: list) -> list:
+    """Collapse duplicate pit entries that share the same type name.
+
+    A pit type commonly appears in two drawings on the sheet (詳細図 + 断面図, or
+    A-A / B-B sections), and Gemini may emit one entry per drawing. Keep ONE entry
+    per normalized type name, merging fields so the survivor carries the best data:
+    prefer readable=true, and back-fill top_elevation / D / region / image from any
+    duplicate when the first occurrence is missing them.
+    """
+    seen: dict = {}      # normalized type -> index into result
+    result: list = []
+    for pit in pit_list:
+        if not pit.type:
+            result.append(pit)
+            continue
+        key = _normalize_pit_type(pit.type)
+        if key not in seen:
+            seen[key] = len(result)
+            result.append(pit)
+            continue
+        existing = result[seen[key]]
+        if pit.readable and not existing.readable:
+            existing.readable = True
+        if existing.top_elevation is None and pit.top_elevation is not None:
+            existing.top_elevation = pit.top_elevation
+        if existing.D is None and pit.D is not None:
+            existing.D = pit.D
+        if existing.region is None and pit.region is not None:
+            existing.region = pit.region
+        if not existing.image_base64 and pit.image_base64:
+            existing.image_base64 = pit.image_base64
+
+    removed = len(pit_list) - len(result)
+    if removed:
+        print(f"[PitDedup] removed {removed} duplicate pit(s): "
+              f"{len(pit_list)} → {len(result)}")
+    return result
 
 
 def _crop_pit_images(pit_list: list, images: List[Image.Image]):
@@ -2092,6 +2312,10 @@ def extract_data_from_images(images: List[Image.Image], pdf_text: str = "",
     if parsed_response.foundation_list:
         parsed_response.foundation_list = _deduplicate_beams(parsed_response.foundation_list)
 
+    # ── Deduplicate pits (詳細図 + 断面図 / A-A + B-B → one entry per type) ───
+    if parsed_response.pit_list:
+        parsed_response.pit_list = _deduplicate_pits(parsed_response.pit_list)
+
     # ── Text-layer locator (fast, deterministic, no API) ────────────────────
     text_layer_summary: dict = {}
     if parsed_response.foundation_list and (pdf_bytes or text_layer_scan.page_scans):
@@ -2172,6 +2396,26 @@ def extract_data_from_images(images: List[Image.Image], pdf_text: str = "",
             if recovered:
                 print(f"[TextLocator] re-applied region to {recovered} plumber-only foundation(s)")
 
+        # Split combined rows ("F11, F23" → F11 + F23) so the UI table and Excel
+        # show one foundation per row. Runs unconditionally (independent of the
+        # text layer); all fields are copied identically to each split part.
+        if parsed_response.foundation_list:
+            before = len(parsed_response.foundation_list)
+            parsed_response.foundation_list = split_combined_types(
+                parsed_response.foundation_list
+            )
+            if len(parsed_response.foundation_list) != before:
+                print(f"[Split] combined rows expanded: {before} → "
+                      f"{len(parsed_response.foundation_list)}")
+
+        # Final field cleanup: strip ▽SGL/▽GL leaks from D and non-rebar captions
+        # (F-code lists, B-formulas) from the rebar columns — covers both plumber
+        # and Gemini-sourced rows.
+        if parsed_response.foundation_list:
+            parsed_response.foundation_list = sanitize_fields(
+                parsed_response.foundation_list
+            )
+
         if pdf_text and parsed_response.foundation_list:
             elev_data = parse_elevations(pdf_text)
             if elev_data.explicit or elev_data.default is not None:
@@ -2233,6 +2477,9 @@ def extract_data_from_images(images: List[Image.Image], pdf_text: str = "",
                 print(f"[PitLocator] located {applied} / {len(parsed_response.pit_list)} pit drawing(s) from text layer")
             except Exception as e:
                 print(f"[PitLocator] failed: {e}")
+        # Focused high-res re-read of top_elevation / D now that regions are set
+        # (fixes nested-dimension misreads like 1,400 vs 1,495 on the first pass).
+        _run_pit_second_pass(parsed_response.pit_list, images)
         _crop_pit_images(parsed_response.pit_list, images)
         print(f"[PitCrop] Cropped {sum(1 for p in parsed_response.pit_list if p.image_base64)} / {len(parsed_response.pit_list)} pit image(s)")
 

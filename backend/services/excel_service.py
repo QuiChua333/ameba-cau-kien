@@ -4,10 +4,12 @@ with extracted foundation/beam data and return the file as bytes.
 """
 import io
 import re
+from copy import copy
 from pathlib import Path
 from typing import List
 
 import openpyxl
+from openpyxl.formula.translate import Translator
 
 from models import FoundationItem, PitHoleItem
 
@@ -23,6 +25,47 @@ CLASSIFICATION_MAP = {
 
 # The data table starts at this row (header is row 9)
 DATA_START_ROW = 10
+
+# Last column to replicate when extending the table (A–P = 1–16)
+_TABLE_MAX_COL = 16
+
+
+def _last_formatted_row(ws, start: int, col: int = 5, hard_cap: int = 2000) -> int:
+    """Return the last pre-formatted data row in the template.
+
+    Template data rows carry a formula in column E (VLOOKUP). The formatted block
+    is the contiguous run of such rows starting at `start`; the first gap ends it.
+    Falls back to `start` when the template has no formula rows.
+    """
+    last = start - 1
+    for r in range(start, hard_cap):
+        c = ws.cell(row=r, column=col)
+        if isinstance(c.value, str) and c.value.startswith("="):
+            last = r
+        elif last >= start:
+            break
+    return max(last, start)
+
+
+def _clone_row_format(ws, src_row: int, dst_row: int, max_col: int = _TABLE_MAX_COL):
+    """Replicate a template row's styling and formulas onto a new (overflow) row.
+
+    Copies the full cell style for every column so borders/fills/fonts match the
+    template, and re-creates the computed columns (E, J, K, L) by translating each
+    formula's relative references from the source row to the destination row.
+    Literal data-column values are NOT copied — fill_excel writes those itself.
+    """
+    for col in range(1, max_col + 1):
+        s = ws.cell(row=src_row, column=col)
+        d = ws.cell(row=dst_row, column=col)
+        if s.has_style:
+            d._style = copy(s._style)
+        if isinstance(s.value, str) and s.value.startswith("="):
+            d.value = Translator(s.value, origin=s.coordinate).translate_formula(d.coordinate)
+    # Match row height so extended rows look identical to the template.
+    src_h = ws.row_dimensions[src_row].height
+    if src_h is not None:
+        ws.row_dimensions[dst_row].height = src_h
 
 
 def _parse_d(d_value: str) -> tuple[float | None, float | None]:
@@ -75,11 +118,20 @@ def fill_excel(
     wb = openpyxl.load_workbook(str(TEMPLATE_PATH))
     ws = wb["掘削深度_Templete"]
 
+    # Last row the template pre-formats (borders + E/J/K/L formulas). Rows beyond
+    # this are cloned from it so a long list never spills into unformatted cells.
+    last_fmt_row = _last_formatted_row(ws, DATA_START_ROW)
+
+    def _ensure_formatted(row: int):
+        if row > last_fmt_row:
+            _clone_row_format(ws, last_fmt_row, row)
+
     # Filter: only foundations and beams (not empty rows)
     items = [item for item in foundation_list if item.type]
 
     for i, item in enumerate(items):
         row = DATA_START_ROW + i
+        _ensure_formatted(row)
 
         # A — Zone (default 1)
         ws.cell(row=row, column=1).value = 1
@@ -115,6 +167,7 @@ def fill_excel(
     pit_offset = len(items)
     for j, pit in enumerate(readable_pits):
         row = DATA_START_ROW + pit_offset + j
+        _ensure_formatted(row)
 
         ws.cell(row=row, column=1).value = 1                      # A — Zone
         ws.cell(row=row, column=2).value = pit_offset + j + 1     # B — STT
