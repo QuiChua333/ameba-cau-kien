@@ -152,12 +152,31 @@ def split_combined_types(foundation_list: list) -> list:
 # Final-pass field sanitiser
 _REBAR_SPEC_RE = re.compile(r'\d+\s*-\s*D\d+(?:@[\d,]+)?')
 
+# Drawing-section captions/annotations that leak into 備考 when the table bbox
+# overlaps the cross-section drawings below it. The real remarks (B-formulas,
+# "-", parenthetical notes) always precede these, so truncate at the first hit.
+_DRAWING_NOISE_RE = re.compile(
+    r'(基礎断面|基礎平面|断面図|柱廻り|柱型リスト|はかま筋|補強筋|スタイロ|'
+    r'地盤改良|ベース筋|偏心方向|つなぎ筋|捨て[ｺコ]|砕石|埋戻|開口補強|立上げ)'
+)
+
+
+def _strip_drawing_text(remarks: str) -> str:
+    """Truncate 備考 at the first drawing-caption/annotation keyword."""
+    if not remarks:
+        return remarks
+    m = _DRAWING_NOISE_RE.search(remarks)
+    return remarks[:m.start()].strip() if m else remarks
+
 
 def sanitize_fields(foundation_list: list) -> list:
-    """Final cleanup of D and rebar fields across all sources (plumber + Gemini).
+    """Final cleanup of D, rebar and remarks across all sources (plumber + Gemini).
 
     - D: drop any ▽GL/▽SGL elevation annotation that leaked into the cell, e.g.
       "1050~300 ▽SGL 564" → "1050~300". D never contains a ▽ marker.
+    - remarks: truncate drawing captions/annotations (基礎断面, 柱廻り, 補強筋, …)
+      that bled in from the cross-section drawings below the table, e.g.
+      "… B1x x B1y = 4,400 x 4,400 基礎断面 柱廻り(スタイロ t=20) …" → "… 4,400".
     - rebar_x/rebar_y (non-beam only): keep only a valid rebar spec (e.g.
       "18-D16"); strip drawing captions / foundation-code lists ("F11,F12,…")
       that bled into the column on wide detail rows. Beams (FW/FG) keep their
@@ -167,6 +186,10 @@ def sanitize_fields(foundation_list: list) -> list:
         d = re.sub(r'\s*▽.*$', '', str(item.dimensions.D), flags=re.DOTALL).strip()
         if d and d != item.dimensions.D:
             item.dimensions.D = d
+
+        cleaned_remarks = _strip_drawing_text(item.remarks or "")
+        if cleaned_remarks != (item.remarks or ""):
+            item.remarks = cleaned_remarks
 
         if item.classification == "FW/FG":
             continue

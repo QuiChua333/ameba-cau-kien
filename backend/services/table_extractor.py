@@ -96,34 +96,48 @@ def _detect_col_map(rows: list, max_header_rows: int = 3,
                         col_map[key] = col_idx
                         data_start = row_idx + 1
 
-    # Positional fallback for rebar columns when arrow headers aren't extractable.
-    # The ベース筋 sub-columns use graphical arrows (← ↑) that pdfplumber can't read
-    # as text, so anchor on the 備考 (remarks) column instead: the two columns
-    # immediately to its LEFT are rebar_x | rebar_y. Anchoring on remarks (not on
-    # D) is robust to an intervening 天端高さ/▽GL elevation column between D and the
-    # rebar columns — the old D-anchored gap==3 rule placed rebar onto that
-    # elevation column and left the real rebar columns unmapped (→ blank rebar).
+    # Rebar columns when arrow headers (← ↑) aren't extractable as text.
+    # PRIMARY (data-driven): the rebar columns are those BETWEEN the D/▽GL anchor
+    # and 備考 that actually carry a rebar spec ("N-Dnn") in the data rows. This is
+    # robust to the empty spacer columns the word-grid inserts between sub-columns
+    # — the first spec-bearing column is rebar_x (←), the second is rebar_y (↑).
+    # FALLBACK (positional): if no data rows are available (header-only / arrows),
+    # take the two columns immediately before 備考.
     if ("rebar_x" not in col_map or "rebar_y" not in col_map):
         d_idx = col_map.get("d")
         elev_idx = col_map.get("elev")
         rem_idx = col_map.get("remarks")
-        # Left edge of the rebar block = rightmost known column before it.
         left_anchor = max([i for i in (d_idx, elev_idx) if i is not None],
                           default=-1)
 
-        if rem_idx is not None and rem_idx - 1 > left_anchor:
-            n_between = rem_idx - left_anchor - 1  # cols strictly between anchor & remarks
-            if n_between >= 2:
-                # … | rebar_x | rebar_y | 備考  (skips any elevation col on the left)
-                col_map.setdefault("rebar_x", rem_idx - 2)
-                col_map.setdefault("rebar_y", rem_idx - 1)
-            elif n_between == 1:
-                # … | rebar (combined) | 備考
-                col_map.setdefault("rebar_x", rem_idx - 1)
-        elif rem_idx is None and left_anchor >= 0:
-            # No remarks column — assume the next two columns are rebar_x/rebar_y.
-            col_map.setdefault("rebar_x", left_anchor + 1)
-            col_map.setdefault("rebar_y", left_anchor + 2)
+        if left_anchor >= 0:
+            ncol = max((len(r) for r in rows if r), default=0)
+            hi = rem_idx if rem_idx is not None else min(left_anchor + 6, ncol)
+
+            rebar_cols = []
+            for col in range(max(left_anchor + 1, start_col), hi):
+                hits = sum(
+                    1 for row in rows[data_start:]
+                    if row and col < len(row)
+                    and _REBAR_SPEC_RE.search(str(row[col] or ""))
+                )
+                if hits:
+                    rebar_cols.append(col)
+
+            if rebar_cols:
+                col_map.setdefault("rebar_x", rebar_cols[0])
+                if len(rebar_cols) >= 2:
+                    col_map.setdefault("rebar_y", rebar_cols[1])
+            elif rem_idx is not None and rem_idx - 1 > left_anchor:
+                n_between = rem_idx - left_anchor - 1
+                if n_between >= 2:
+                    col_map.setdefault("rebar_x", rem_idx - 2)
+                    col_map.setdefault("rebar_y", rem_idx - 1)
+                elif n_between == 1:
+                    col_map.setdefault("rebar_x", rem_idx - 1)
+            elif rem_idx is None:
+                col_map.setdefault("rebar_x", left_anchor + 1)
+                col_map.setdefault("rebar_y", left_anchor + 2)
 
     return col_map, data_start
 
@@ -238,44 +252,115 @@ def _extract_item_from_row(row: list, col_map: dict) -> "Optional[FoundationItem
         return None
 
 
-def _merge_continuation_rows(table: list, col_maps: list, data_start: int) -> list:
-    """Pre-merge continuation rows (empty type column) into the previous data row.
+# Drawing-section caption/annotation keywords that mark the end of the schedule
+# (the cross-section drawings drawn below it). Never appear in real table cells.
+_DRAWING_SECTION_RE = re.compile(
+    r'基礎断面|基礎平面|断面図|柱型リスト|柱廻り|はかま筋|補強筋|スタイロ|'
+    r'ベース筋|偏心方向|つなぎ筋|捨て[ｺコ]|開口補強|地盤改良'
+)
 
-    When pdfplumber's word-grid uses a small y_gap, multi-line note cells are
-    split into separate row bands. The continuation row has an empty type column
-    but non-empty remarks. This function merges such rows back into the preceding
-    data row so that multi-line notes are concatenated correctly.
+
+def _merge_continuation_rows(table: list, col_maps: list, data_start: int,
+                             row_centers: Optional[list] = None) -> list:
+    """Merge multi-line cell bands (no type column) into the row they belong to.
+
+    The word-grid splits a tall multi-line cell (e.g. a two-line 備考 note) into
+    several row bands. A band that carries content but no foundation type is an
+    "orphan" belonging to a neighbouring data row.
+
+    Crucially, the orphan does NOT always belong to the row ABOVE: when a row's
+    type code is vertically centred in a tall row, the cell's FIRST line lands in
+    a band ABOVE the type band, so blindly merging "into the previous row" leaks
+    that line onto the preceding foundation (e.g. F18's "B0x…" line stolen by
+    F140). With `row_centers` we instead attach each orphan to the NEAREST typed
+    row by vertical distance; without them we fall back to the previous row.
+
+    Contributions are concatenated in row order, so an orphan above a type keeps
+    its content before the type row's own cell text.
     """
     if not table or not col_maps:
         return table
 
     type_cols = {cm["type"] for cm in col_maps if "type" in cm}
-    result = [list(row) if row else None for row in table]
-    last_data_idx = data_start - 1
+    n = len(table)
 
-    for i in range(data_start, len(result)):
-        row = result[i]
-        if not row or all(c is None or str(c).strip() == "" for c in row):
+    def _is_empty(row) -> bool:
+        return not row or all(c is None or str(c).strip() == "" for c in row)
+
+    def _has_type(row) -> bool:
+        return any(tidx < len(row) and row[tidx] and str(row[tidx]).strip()
+                   for tidx in type_cols)
+
+    # The cross-section drawings sit directly below the schedule. The first row
+    # carrying a drawing caption/annotation keyword (基礎断面, 基礎平面, 柱型リスト…)
+    # marks the end of tabular data — rows from there down must NOT be merged into
+    # the last foundation (otherwise the drawing's F-code captions corrupt its
+    # Lx/Ly/D cells, e.g. F18 Lx → "5,400 F11,F12,…" → unparseable → 0).
+    # Scan ONLY within the table's own columns (≤ rightmost mapped column); the
+    # far-right "ＴＮＦ工法概要" spec block contains "地盤改良" etc. and would
+    # otherwise truncate the table prematurely.
+    right_edge = max((max(cm.values()) for cm in col_maps if cm), default=n)
+    cutoff = n
+    for i in range(data_start, n):
+        row = table[i]
+        if row and any(
+            _DRAWING_SECTION_RE.search(str(row[c] or ""))
+            for c in range(min(len(row), right_edge + 1))
+        ):
+            cutoff = i
+            break
+
+    real = [i for i in range(data_start, cutoff) if not _is_empty(table[i])]
+    typed = [i for i in real if _has_type(table[i])]
+    if not typed:
+        return table
+
+    def _center(i: int) -> float:
+        if row_centers and 0 <= i < len(row_centers):
+            return float(row_centers[i])
+        return float(i)  # index proxy → ties resolve to the previous row
+
+    # Assign every real row to a target typed row.
+    typed_set = set(typed)
+    assign: dict = {}
+    for i in real:
+        if i in typed_set:
+            assign[i] = i
             continue
+        prev_t = max((t for t in typed if t < i), default=None)
+        next_t = min((t for t in typed if t > i), default=None)
+        if prev_t is not None and next_t is not None:
+            assign[i] = (prev_t if abs(_center(i) - _center(prev_t))
+                         <= abs(_center(i) - _center(next_t)) else next_t)
+        else:
+            assign[i] = prev_t if prev_t is not None else next_t
 
-        has_type = any(
-            tidx < len(row) and row[tidx] and str(row[tidx]).strip()
-            for tidx in type_cols
-        )
+    result = [list(row) if row else None for row in table]
+    ncol = max(len(table[t]) for t in typed)
 
-        if has_type:
-            last_data_idx = i
-        elif last_data_idx >= data_start:
-            # Continuation row: merge every non-empty cell into the previous data row
-            prev = result[last_data_idx]
-            for col_idx in range(min(len(row), len(prev))):
-                cell = row[col_idx]
-                if cell is None or str(cell).strip() == "":
-                    continue
-                prev_val = str(prev[col_idx] or "").strip()
-                cell_str = str(cell).strip()
-                prev[col_idx] = (prev_val + " " + cell_str).strip() if prev_val else cell_str
-                result[i][col_idx] = None  # clear to avoid double-use
+    from collections import defaultdict
+    groups: dict = defaultdict(list)
+    for i in real:
+        groups[assign[i]].append(i)
+
+    for t, members in groups.items():
+        members.sort()  # row order → preserves "orphan above type" ordering
+        merged = [None] * ncol
+        for col_idx in range(ncol):
+            parts = []
+            for i in members:
+                row = table[i]
+                if col_idx < len(row):
+                    cell = row[col_idx]
+                    if cell is not None and str(cell).strip():
+                        parts.append(str(cell).strip())
+            merged[col_idx] = " ".join(parts) if parts else None
+        result[t] = merged
+
+    # Clear rows whose content was merged into another row.
+    for i in real:
+        if assign[i] != i and result[i]:
+            result[i] = [None] * len(result[i])
 
     return result
 
@@ -358,9 +443,12 @@ def _build_table_from_words(page, bbox,
         [" ".join(buckets.get((r, c), [])) for c in range(nc)]
         for r in range(nr)
     ]
+    # Vertical centre of each row band — lets the continuation merge attach an
+    # orphan (type-less) band to the nearest row by geometry, not just "previous".
+    row_centers = [round((lo + hi) / 2, 1) for (lo, hi) in row_bands]
     print(f"[TableExtract] word-grid: {nr} rows × {nc} cols "
           f"from bbox {tuple(round(v) for v in bbox)}")
-    return table
+    return table, row_centers
 
 
 def _parse_number(text: Optional[str]) -> Optional[float]:
@@ -438,8 +526,15 @@ def _classify_from_remarks(text: str) -> str:
 
 
 def _is_foundation_type(value: str) -> bool:
-    """Return True if value looks like a regular foundation type (F1, F2A, F10...)."""
-    return bool(re.match(r'^F\d+[A-Za-z0-9]*$', value.strip()))
+    """Return True for a single foundation code (F1, F2A, F10…) OR a combined cell
+    listing several of them ("F11,F23", "F132、F21"). Combined cells are kept here
+    and split downstream by split_combined_types so the word-grid's reliable
+    tabular data (Lx/Ly/D/rebar) isn't discarded for grouped rows."""
+    v = value.strip()
+    if re.match(r'^F\d+[A-Za-z0-9]*$', v):
+        return True
+    parts = [p.strip() for p in re.split(r'[,、，\s]+', v) if p.strip()]
+    return len(parts) >= 2 and all(re.match(r'^F\d+[A-Za-z0-9]*$', p) for p in parts)
 
 
 _REBAR_SPEC_RE = re.compile(r'\d+-D\d+(?:@\d+)?')
@@ -488,11 +583,14 @@ def _clean_rebar_spec(text: str) -> str:
 # Table parsing
 # ──────────────────────────────────────────────────────────────────────────────
 
-def _parse_table(table: list) -> Tuple[List[FoundationItem], int]:
+def _parse_table(table: list, row_centers: Optional[list] = None) -> Tuple[List[FoundationItem], int]:
     """Parse a single pdfplumber table into (items, last_data_row_idx).
 
     Handles both single-column and side-by-side (double/multi-wide) foundation
     schedules — the latter have duplicate header rows placed horizontally.
+
+    row_centers: optional per-row vertical centres (from the word-grid) used to
+    attach multi-line orphan bands to the nearest row by geometry.
 
     last_data_row_idx: index into `table` of the last row that contained valid
     foundation data (used to crop the image). Returns ([], -1) when the table
@@ -509,7 +607,7 @@ def _parse_table(table: list) -> Tuple[List[FoundationItem], int]:
         return [], -1
 
     # Merge continuation rows (multi-line notes cells split across row bands)
-    table = _merge_continuation_rows(table, col_maps, data_start)
+    table = _merge_continuation_rows(table, col_maps, data_start, row_centers)
 
     items: List[FoundationItem] = []
     last_data_row_idx = -1
@@ -629,8 +727,10 @@ def extract_foundation_table_from_open(pdf) -> TableExtractionResult:
             for tbl in table_objects:
                 # PRIMARY: word-centroid extraction — immune to cell-boundary issues.
                 # find_tables() is used only to locate the table bbox on the page.
-                word_table = _build_table_from_words(page, tbl.bbox)
-                items, last_row_idx = _parse_table(word_table) if word_table else ([], -1)
+                word_table, word_row_centers = _build_table_from_words(page, tbl.bbox)
+                items, last_row_idx = (
+                    _parse_table(word_table, word_row_centers) if word_table else ([], -1)
+                )
 
                 # FALLBACK: native pdfplumber cell extraction (original approach).
                 if len(items) < _MIN_DATA_ROWS:
