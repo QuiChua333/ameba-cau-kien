@@ -988,6 +988,16 @@ INSIDE the panel, look at its OWN left edge for a vertical chain of dimension nu
   • D = the vertical dimension spanning the HATCHED concrete body
     → return as POSITIVE integer  (e.g. 350)
 
+⚠️ CRITICAL — OUTER TOTAL DIMENSION IS NEITHER top_elevation NOR D:
+  A panel's left chain often shows THREE stacked numbers where the OUTERMOST equals
+  the sum of the inner two — the soil gap and the beam body, e.g.:
+        325  ← soil gap  (top_elevation = -325)
+      1,000  ← OUTER TOTAL = 325 + 675  ← ❌ NOT D, NOT top_elevation — IGNORE
+        675  ← hatched beam body  (D = 675)
+  Rule: if value_A + value_B == value_C, then C is the overall embedment total —
+  discard C. top_elevation = the upper sub (A, the soil gap, → negative); D = the
+  lower sub (B, the concrete body). NEVER report the total (1,000) as D.
+
 If a panel type has two variants (FW1 一般部 and FW1 間柱部), use the 一般部 panel.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -1006,6 +1016,9 @@ NUMBERS TO ABSOLUTELY IGNORE
    These are steel bar specifications — the number after "@" is bar spacing, not D.
 ❌ Dimensions from REGULAR FOUNDATION drawings (F1, F2, F5B etc.) on the same page.
    Those foundations have their own ▽GL lines and dimension chains — do NOT use them.
+❌ The OUTER total dimension that spans BOTH the soil gap and the beam body (it equals
+   their sum, e.g. 1,000 = 325 soil + 675 beam). It is the overall embedment depth, NOT
+   D. D is ONLY the hatched beam body (the lower sub, 675). See the CRITICAL note above.
 ❌ Wall/panel height above ▽GL: numbers like 500, 1,200 are above ground, not underground.
 ❌ Wall cap width: a small "150" shown as a horizontal dimension at the very top of the wall.
 ❌ Slab thickness: "150" or "t=150" appearing on the RIGHT side of the ▽GL line.
@@ -1987,22 +2000,85 @@ def _apply_pit_text_elevations(pit_list: list, elev_map: dict) -> list:
     call before the pit second pass (to detect/seed) and again after it (to
     re-assert the authoritative value over any vision re-read).
     """
-    by_norm = {_normalize_pit_type(p.type): p for p in pit_list}
     for name, elev in elev_map.items():
-        key = _normalize_pit_type(name)
-        existing = by_norm.get(key)
+        cs = _pit_code_set(name)
+        # Match by code-set so an individual floor-plan name (e.g. "EV2ピット") updates
+        # the combined "EV1, EV2ピット" instead of being appended as a duplicate.
+        existing = next((p for p in pit_list if _pit_code_set(p.type) & cs), None)
         if existing is not None:
             existing.top_elevation = float(elev)
             existing.readable = True
         else:
-            new_pit = PitHoleItem(
+            pit_list.append(PitHoleItem(
                 type=name, top_elevation=float(elev), D=None,
                 readable=True, region=None, image_base64=None,
-            )
-            pit_list.append(new_pit)
-            by_norm[key] = new_pit
+            ))
             print(f"[PitText] added pit '{name}' (GL{elev:+.0f}) missing from vision pass")
     return pit_list
+
+
+_PIT_COMBINED_RE = re.compile(r'^(.+?)(ピット|ﾋ゚ｯﾄ|水槽|側溝)\s*([①-⑳0-9]*)\s*$')
+
+
+def _pit_code_set(name: str) -> set:
+    """The set of individual pit codes a name covers, for dedup comparison.
+
+    "EV1, EV2ピット" → {"EV1ピット", "EV2ピット"}; "EV1ピット" → {"EV1ピット"};
+    "消火水槽" → {"消火水槽"}. Lets a combined entry and its individual entries be
+    recognised as the SAME pit(s) without rewriting the displayed name.
+    """
+    m = _PIT_COMBINED_RE.match((name or "").strip())
+    if m:
+        prefix, suffix, tail = m.group(1), m.group(2), m.group(3)
+        codes = [c.strip() for c in re.split(r'[,、，\s]+', prefix) if c.strip()]
+        if len(codes) > 1:
+            return {_normalize_pit_type(f"{c}{suffix}{tail}") for c in codes}
+    return {_normalize_pit_type(name)}
+
+
+def _merge_subsumed_pits(pit_list: list) -> list:
+    """Collapse pit entries that refer to the same pit(s), KEEPING the name as drawn.
+
+    The vision pass often emits BOTH the combined detail-title "EV1, EV2ピット" AND the
+    individual "EV1ピット"/"EV2ピット" (the floor-plan text layer also uses individual
+    names). These are the same pits, so we group entries whose code-sets overlap and
+    keep ONE survivor — the entry with the LARGEST code-set, i.e. the combined name
+    exactly as the drawing writes it (no name splitting). The survivor back-fills any
+    missing top_elevation / D / region / image from the entries merged into it.
+    """
+    groups: list = []   # each: [code_set, [members…]]
+    for pit in pit_list:
+        cs = _pit_code_set(pit.type)
+        hit = next((g for g in groups if g[0] & cs), None)
+        if hit:
+            hit[0] |= cs
+            hit[1].append(pit)
+        else:
+            groups.append([set(cs), [pit]])
+
+    result: list = []
+    for _cset, members in groups:
+        survivor = max(members, key=lambda p: len(_pit_code_set(p.type)))
+        for p in members:
+            if p is survivor:
+                continue
+            if p.readable and not survivor.readable:
+                survivor.readable = True
+            if survivor.top_elevation is None and p.top_elevation is not None:
+                survivor.top_elevation = p.top_elevation
+            if survivor.D is None and p.D is not None:
+                survivor.D = p.D
+            if survivor.region is None and p.region is not None:
+                survivor.region = p.region
+            if not survivor.image_base64 and p.image_base64:
+                survivor.image_base64 = p.image_base64
+        result.append(survivor)
+
+    removed = len(pit_list) - len(result)
+    if removed:
+        print(f"[PitDedup] merged {removed} duplicate/subsumed pit(s): "
+              f"{len(pit_list)} → {len(result)}")
+    return result
 
 
 def _deduplicate_pits(pit_list: list) -> list:
@@ -2358,7 +2434,9 @@ def extract_data_from_images(images: List[Image.Image], pdf_text: str = "",
 
     # ── Deduplicate pits (詳細図 + 断面図 / A-A + B-B → one entry per type) ───
     if parsed_response.pit_list:
-        parsed_response.pit_list = _deduplicate_pits(parsed_response.pit_list)
+        # Collapse combined + individual entries for the same pit(s), keeping the name
+        # exactly as drawn ("EV1, EV2ピット" stays combined — no name splitting).
+        parsed_response.pit_list = _merge_subsumed_pits(parsed_response.pit_list)
 
     # ── Pit detection + authoritative elevation from the floor-plan text layer ──
     # "…詳細図参照(底盤天端…GL-XXX)" gives the exact slab-top elevation and reliably
@@ -2492,10 +2570,32 @@ def extract_data_from_images(images: List[Image.Image], pdf_text: str = "",
 
         if pdf_text and parsed_response.foundation_list:
             elev_data = parse_elevations(pdf_text)
+            floor_plan_elev = dict(elev_data.explicit)   # 伏図 values, before section fill
+            section_elev = dict(text_layer_scan.section_elevations)
+            # Cross-section 天端 elevations (plain dims + "[ ]内の数値は" bracket notes)
+            # read deterministically during the Phase-1a scan. Fill types the floor
+            # plan doesn't cover; setdefault keeps a 伏図 annotation authoritative.
+            for code, val in section_elev.items():
+                elev_data.explicit.setdefault(code, val)
             if elev_data.explicit or elev_data.default is not None:
                 parsed_response.foundation_list = resolve_elevations_for_list(
                     parsed_response.foundation_list, elev_data
                 )
+            # Flag a CONFLICT: floor-plan (伏図) 天端 ≠ the section (断面) 天端 for the
+            # same type. We keep the 伏図 value as top_elevation (authoritative) but
+            # record the section value in top_elevation_alt so the UI/Excel can show
+            # it beside the cell and highlight it red for manual checking.
+            for item in parsed_response.foundation_list:
+                if item.classification == "FW/FG":
+                    continue
+                for part in re.split(r'[,、，\s]+', (item.type or "").upper()):
+                    part = part.strip()
+                    fp, sec = floor_plan_elev.get(part), section_elev.get(part)
+                    if fp is not None and sec is not None and fp != sec:
+                        item.top_elevation_alt = float(sec)
+                        print(f"[ElevConflict] {item.type}: 伏図 {fp} vs 断面 {sec} "
+                              f"→ keep {fp}, flag {sec}")
+                        break
 
         if parsed_response.foundation_list:
             parsed_response.foundation_list.sort(key=_foundation_sort_key)
@@ -2544,6 +2644,18 @@ def extract_data_from_images(images: List[Image.Image], pdf_text: str = "",
                 overlap_futures["pit_pass"].result()
             except Exception as e:
                 print(f"[PitPass] pit locate/re-read failed: {e}")
+        # Fill pit slab thickness D from the deterministic 詳細図 read ONLY where the
+        # vision pass left it null — the Gemini value (it sees the image) wins when
+        # present; this is the fallback so no pit is left without a D.
+        pit_d_map = getattr(text_layer_scan, "pit_d_map", {}) or {}
+        if pit_d_map:
+            by_norm = {_normalize_pit_type(k): v for k, v in pit_d_map.items()}
+            for pit in parsed_response.pit_list:
+                if pit.D is None:
+                    d = by_norm.get(_normalize_pit_type(pit.type))
+                    if d is not None:
+                        pit.D = float(d)
+                        print(f"[PitSlabD] filled {pit.type} D={d} (vision null)")
         # Re-assert floor-plan text-layer elevations AFTER the vision second pass:
         # 底盤天端 is authoritative, so it overrides any vision top_elevation.
         if pit_elev_map:

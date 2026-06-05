@@ -92,7 +92,7 @@ function Badge({ children, className }: { children: React.ReactNode; className?:
     );
 }
 
-function TopElevationBadge({ value }: { value: number | null | undefined }) {
+function TopElevationBadge({ value, alt }: { value?: number | null; alt?: number | null }) {
     if (value === null || value === undefined) {
         return <span className="text-gray-400 text-xs italic">N/A</span>;
     }
@@ -102,7 +102,20 @@ function TopElevationBadge({ value }: { value: number | null | undefined }) {
         : value > 0
         ? "bg-green-50 text-green-700 border-green-200"
         : "bg-gray-100 text-gray-600 border-gray-200";
-    return <Badge className={className}>{label} mm</Badge>;
+    const altLabel = alt === 0 ? "▽GL ±0" : (alt ?? 0) > 0 ? `▽GL +${alt}` : `▽GL ${alt}`;
+    return (
+        <div className="flex flex-col gap-1">
+            <Badge className={className}>{label} mm</Badge>
+            {alt !== null && alt !== undefined && (
+                <span
+                    className="text-[10px] font-medium text-red-600"
+                    title="Mặt cắt (断面) khác mặt bằng (伏図) — đang lấy giá trị mặt bằng, cần kiểm tra"
+                >
+                    ⚠ Mặt cắt: {altLabel} mm
+                </span>
+            )}
+        </div>
+    );
 }
 
 function ClassificationBadge({ type }: { type: string }) {
@@ -380,8 +393,8 @@ export function ResultsTable({ data, pdfFile }: ResultsTableProps) {
                                                     </span>
                                                 </div>
                                             </td>
-                                            <td className="px-6 py-4">
-                                                <TopElevationBadge value={item.top_elevation} />
+                                            <td className={`px-6 py-4 ${item.top_elevation_alt != null ? "bg-red-50" : ""}`}>
+                                                <TopElevationBadge value={item.top_elevation} alt={item.top_elevation_alt} />
                                             </td>
                                             <td className="px-6 py-4 font-mono text-gray-700">{item.rebar_x}</td>
                                             <td className="px-6 py-4 font-mono text-gray-700">{item.rebar_y}</td>

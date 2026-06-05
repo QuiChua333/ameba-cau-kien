@@ -27,6 +27,11 @@ from services.table_extractor import (
     extract_foundation_table_from_open,
     TableExtractionResult,
 )
+from services.text_parser import (
+    parse_elevations,
+    parse_section_elevations,
+    parse_pit_slab_thickness,
+)
 from models import ItemRegion
 from services.drawing_locator import (
     build_page_scan,
@@ -44,6 +49,12 @@ class TextLayerScanResult:
     foundation_regions: Dict[str, ItemRegion] = field(default_factory=dict)
     beam_captions: Dict[int, Dict[str, dict]] = field(default_factory=dict)
     page_scans: List[dict] = field(default_factory=list)
+    # {CODE: negative_mm} 天端 elevations read from 基礎断面 cross-sections (plain
+    # dimensions and "[ ]内の数値は" bracket notes). Computed while the PDF is open once.
+    section_elevations: Dict[str, int] = field(default_factory=dict)
+    # {pit_name: D_mm} floor-slab thickness read from each pit's 詳細図. Fills pits
+    # whose D the Gemini vision pass leaves null (vision value wins when present).
+    pit_d_map: Dict[str, int] = field(default_factory=dict)
 
 
 def scan_text_layer(pdf_bytes: bytes) -> TextLayerScanResult:
@@ -66,6 +77,22 @@ def scan_text_layer(pdf_bytes: bytes) -> TextLayerScanResult:
             )
             result.foundation_regions = find_foundation_drawing_regions_from_pages(page_scans_full)
             result.beam_captions = find_beam_section_captions_from_pages(page_scans_full)
+
+            # Cross-section 天端 elevations. Reuse THIS open document (pages already
+            # parsed above) — reopening to read word geometry would re-parse the whole
+            # dense PDF and roughly double latency. Gate on 基礎断面 so PDFs without
+            # cross-sections pay nothing beyond the cheap (warm) text scan.
+            try:
+                full_text = "\n".join(page.extract_text() or "" for page in pdf.pages)
+                if '基礎断面' in full_text:
+                    elev = parse_elevations(full_text)
+                    result.section_elevations = parse_section_elevations(
+                        pdf, elev.explicit
+                    )
+                if '詳細図' in full_text:
+                    result.pit_d_map = parse_pit_slab_thickness(pdf)
+            except Exception as e:
+                print(f"[Phase1a] section-elevation scan failed: {e}")
             result.page_scans = [
                 {
                     "page_idx": page_scan["page_idx"],

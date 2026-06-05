@@ -22,6 +22,7 @@ export interface FoundationItem {
     type: string;
     dimensions: Dimensions;
     top_elevation?: number | null;
+    top_elevation_alt?: number | null;
     rebar_x: string;
     rebar_y: string;
     remarks: string;

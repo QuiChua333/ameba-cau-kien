@@ -26,6 +26,7 @@ class FoundationItem(BaseModel):
     type: str = Field(..., description="Foundation type identifier (e.g., F1, F2, FG1, FW1)")
     dimensions: Dimensions = Field(..., description="Physical dimensions of the foundation (Lx, Ly, D). Fill with 0 if not applicable (e.g. for Beams).")
     top_elevation: Optional[float] = Field(None, description="Top elevation of structure relative to ▽GL in mm. Negative if below GL (e.g., -200), positive if above.")
+    top_elevation_alt: Optional[float] = Field(None, description="Alternate 天端 read from the 断面 (cross-section) drawing when it CONFLICTS with the chosen floor-plan top_elevation. None when they agree. Flags the cell for manual review (Excel: red cell + note).")
     rebar_x: str = Field(..., description="Rebar spec for X direction (left arrow / horizontal)")
     rebar_y: str = Field(..., description="Rebar spec for Y direction (up arrow / vertical)")
     remarks: str = Field(..., description="Remarks column content. Return empty string if blank.")

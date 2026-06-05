@@ -394,6 +394,22 @@ def _gap_cluster(vals: list, gap: float) -> list:
     return bands
 
 
+def _join_cell(words: list) -> str:
+    """Join the words of one (row, col) bucket back into readable cell text.
+
+    Sort by (rounded top, x0) so a multi-line cell (e.g. a two-line 備考 note
+    "B0x…/B1x…") is read line-by-line, top line fully before the bottom line.
+    Combined with extract_words(use_text_flow=True) — which rebuilds whole words
+    from the PDF's authored character stream instead of geometrically x-sorting
+    glyphs — this avoids the char-by-char interleaving ("B B 0 1 x x …") that
+    appears on glyph-split CAD PDFs whose two stacked lines sit within y_tolerance.
+    """
+    if not words:
+        return ""
+    ws = sorted(words, key=lambda w: (round(w["top"]), w["x0"]))
+    return " ".join(w.get("text", "") for w in ws)
+
+
 def _build_table_from_words(page, bbox,
                              x_gap: float = 14.0,
                              y_gap: float = 5.0) -> list:
@@ -415,8 +431,12 @@ def _build_table_from_words(page, bbox,
     """
     try:
         region = page.crop(bbox)
+        # use_text_flow=True rebuilds words from the PDF's authored character
+        # stream (reading order) instead of re-sorting glyphs by x. On glyph-split
+        # CAD PDFs this keeps a two-line cell's stacked lines from interleaving
+        # char-by-char ("B B 0 1 x x …") and reassembles proper words ("B0x").
         words = region.extract_words(x_tolerance=4, y_tolerance=4,
-                                     keep_blank_chars=False)
+                                     keep_blank_chars=False, use_text_flow=True)
     except Exception:
         return []
     if not words:
@@ -446,11 +466,11 @@ def _build_table_from_words(page, bbox,
         c = _col((w["x0"] + w["x1"]) / 2)
         r = _row((w["top"] + w["bottom"]) / 2)
         if r >= 0 and c >= 0:
-            buckets.setdefault((r, c), []).append(w["text"])
+            buckets.setdefault((r, c), []).append(w)
 
     nc, nr = len(col_bands), len(row_bands)
     table = [
-        [" ".join(buckets.get((r, c), [])) for c in range(nc)]
+        [_join_cell(buckets.get((r, c), [])) for c in range(nc)]
         for r in range(nr)
     ]
     # Vertical centre of each row band — lets the continuation merge attach an
@@ -734,6 +754,20 @@ def extract_foundation_table_from_open(pdf) -> TableExtractionResult:
         ]
         scan = candidates if candidates else pages
 
+        # A page's find_tables() often returns several overlapping regions — the
+        # tight schedule box AND a page-wide box that also swallows the cross-section
+        # drawings below it. The wide box pollutes the word-grid and merges adjacent
+        # foundation rows (e.g. F1A+F1B+F2 collapse, losing their Lx/Ly). So DON'T
+        # return the first table that parses; evaluate every candidate and keep the
+        # best one — most rows with real dimensions (Lx>0), then most rows overall.
+        best: Optional[TableExtractionResult] = None
+        best_score: tuple = (-1, -1)
+
+        def _score(items: list) -> tuple:
+            clean = sum(1 for it in items
+                        if it.dimensions.Lx > 0 and " " not in it.type)
+            return (clean, len(items))
+
         for page_num, page in scan:
             table_objects = page.find_tables()
             if not table_objects:
@@ -741,40 +775,52 @@ def extract_foundation_table_from_open(pdf) -> TableExtractionResult:
             for tbl in table_objects:
                 # PRIMARY: word-centroid extraction — immune to cell-boundary issues.
                 # find_tables() is used only to locate the table bbox on the page.
-                word_table, word_row_centers = _build_table_from_words(page, tbl.bbox)
+                word_grid = _build_table_from_words(page, tbl.bbox)
+                word_table, word_row_centers = word_grid if word_grid else (None, None)
                 items, last_row_idx = (
                     _parse_table(word_table, word_row_centers) if word_table else ([], -1)
                 )
 
                 # FALLBACK: native pdfplumber cell extraction (original approach).
                 if len(items) < _MIN_DATA_ROWS:
-                    print("[TableExtract] word-grid yielded insufficient rows "
-                          f"({len(items)}); falling back to find_tables() cells")
                     raw_data = tbl.extract()
                     items, last_row_idx = _parse_table(raw_data)
+                    word_table = None
 
-                if len(items) >= _MIN_DATA_ROWS:
-                    # Crop image bbox to just the data section.
-                    crop_bottom = tbl.bbox[3]
-                    if word_table and 0 <= last_row_idx < len(word_table):
-                        # Approximate the bottom of the last data row from the
-                        # word-grid row index; fall back to full table bottom.
-                        try:
-                            crop_bottom = tbl.rows[last_row_idx].bbox[3] + 4
-                        except (IndexError, AttributeError):
-                            pass
-                    elif 0 <= last_row_idx < len(tbl.rows):
+                if len(items) < _MIN_DATA_ROWS:
+                    continue
+
+                # Crop image bbox to just the data section.
+                crop_bottom = tbl.bbox[3]
+                if word_table and 0 <= last_row_idx < len(word_table):
+                    # Approximate the bottom of the last data row from the
+                    # word-grid row index; fall back to full table bottom.
+                    try:
                         crop_bottom = tbl.rows[last_row_idx].bbox[3] + 4
-                    data_bbox = (tbl.bbox[0], tbl.bbox[1], tbl.bbox[2], crop_bottom)
-                    print(f"[TableExtract] Found {len(items)} rows on page {page_num}, "
-                          f"data_bbox={data_bbox}")
-                    return TableExtractionResult(
+                    except (IndexError, AttributeError):
+                        pass
+                elif 0 <= last_row_idx < len(tbl.rows):
+                    crop_bottom = tbl.rows[last_row_idx].bbox[3] + 4
+                data_bbox = (tbl.bbox[0], tbl.bbox[1], tbl.bbox[2], crop_bottom)
+
+                score = _score(items)
+                print(f"[TableExtract] candidate: {len(items)} rows "
+                      f"(score={score}) on page {page_num}, "
+                      f"bbox={tuple(round(v) for v in tbl.bbox)}")
+                if score > best_score:
+                    best_score = score
+                    best = TableExtractionResult(
                         items=items,
                         page_num=page_num,
                         bbox=data_bbox,
                         pdf_width=page.width,
                         pdf_height=page.height,
                     )
+
+        if best is not None:
+            print(f"[TableExtract] Selected best table: {len(best.items)} rows "
+                  f"on page {best.page_num}, data_bbox={best.bbox}")
+            return best
     except Exception as e:
         print(f"[TableExtract] Error: {e}")
 

@@ -133,6 +133,247 @@ def parse_pit_elevations(pdf_text: str) -> dict:
     return result
 
 
+# Pit-detail title, e.g. "消火水槽詳細図", "EVピット①詳細図", "ESCピット詳細図".
+_PIT_DETAIL_TITLE_RE = re.compile(
+    r'(消火水槽|EV[ピﾋ]ット[①-⑳0-9]*|ES[CＣ]?[ピﾋ]ット[①-⑳0-9]*'
+    r'|[ピﾋ]ット[①-⑳0-9]*|側溝|水槽)\s*詳細図',
+    re.UNICODE,
+)
+
+
+def parse_pit_slab_thickness(pdf) -> dict:
+    """Read each pit's floor-slab thickness D from its 詳細図 cross-section.
+
+    pdf: an ALREADY-OPEN pdfplumber document (reuse the pipeline's single open;
+    reopening a dense CAD PDF costs tens of seconds).
+
+    In a pit detail the left dimension chain runs ▽GL → slab top → slab bottom →
+    leveling concrete (捨てコン). Read by RELATION rather than absolute magic ranges:
+      • depth = the largest dim in the box = ▽GL → slab top (the top_elevation span).
+      • D = the segment DIRECTLY BELOW the slab top = slab bottom − slab top. It is
+        the nearest dim under `depth` that is SMALL RELATIVE TO depth (value < depth/2)
+        — this skips other GL-anchored totals (e.g. a GL→improvement-bottom dim that
+        is nearly as large as depth) yet still accepts a thin OR thick slab, because
+        the cut-off scales with the pit's own depth instead of a fixed 100–400 mm.
+    The dimension text is rotated 90°, so it reads reversed ("200" → "002").
+
+    Returns {pit_name: D_mm}. Used only to FILL pits whose D the Gemini vision pass
+    left null — the vision value wins when present.
+    """
+    result: dict = {}
+    try:
+        for page in pdf.pages:
+            page_text = page.extract_text() or ""
+            if '詳細図' not in page_text:
+                continue
+            words = page.extract_words(extra_attrs=['upright'])
+            for w in words:
+                m = _PIT_DETAIL_TITLE_RE.search(w['text'])
+                if not m or '参照' in w['text']:   # "…詳細図参照" is a floor-plan leader
+                    continue
+                name = m.group(1)
+                tx, ty = w['x0'], w['top']
+                # The detail box sits ABOVE its title; collect its rotated dims.
+                dims = []
+                for v in words:
+                    if v.get('upright') or not re.search(r'[0-9]', v['text']):
+                        continue
+                    s = v['text'][::-1].replace(',', '')
+                    if not re.fullmatch(r'[0-9]+', s):
+                        continue
+                    xc = (v['x0'] + v['x1']) / 2
+                    if abs(xc - tx) < 260 and (ty - 270) < v['top'] < (ty + 5):
+                        dims.append((int(s), (v['top'] + v['bottom']) / 2))
+                if not dims:
+                    continue
+                depth = max(dims, key=lambda d: d[0])           # ▽GL → slab top
+                # D = the segment right below the slab top (slab bottom − slab top),
+                # small relative to depth so other GL-anchored totals are skipped.
+                below = [d for d in dims
+                         if d[1] > depth[1] + 2 and d[0] < depth[0] / 2]
+                if below:
+                    below.sort(key=lambda d: d[1])              # closest below the depth
+                    result.setdefault(name, below[0][0])
+    except Exception as e:
+        print(f"[PitSlabD] failed: {e}")
+    return result
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Cross-section 天端 elevations
+# ──────────────────────────────────────────────────────────────────────────────
+#
+# Many foundations have NO floor-plan elevation annotation; their 基礎天端高さ is
+# shown only inside the 基礎断面 cross-section as a dimension chain ▽GL → foundation
+# top → base. We read it directly instead of falling back to the project default
+# (which would be wrong for any non-default foundation, e.g. a 1,000-deep one).
+#
+# The 天端 = the chain segments between ▽GL and the base region (cover 30/70/100,
+# はかま 250): a labelled total if one is drawn (a value V = a + b of two segments,
+# e.g. 1,000 = 675+325), else the sum of the segments (e.g. 200+300 = 500).
+# Section text is rotated 90°, so pdfplumber returns it REVERSED ("[1,000]" →
+# "]000,1["); we reverse each token. A bracket note
+# 「[ ]内の数値は、F1Aの数値とする」 gives that owner the SAME-style ([ ] vs ( ))
+# chain value; the other types in the title take the plain value.
+
+_BRACKET_NOTE_RE = re.compile(
+    r'([\[\]（）()])\s*内の数値は[\s、,]*(F\d+[A-Za-z0-9]*)\s*の数値とする',
+    re.UNICODE,
+)
+_SECTION_TITLE_RE = re.compile(r'(F\d+[A-Za-z0-9,、，\s]*?)\s*基礎断面', re.UNICODE)
+_CODE_SPLIT_RE = re.compile(r'[,、，\s]+')
+
+
+def _bracket_style(ch: str) -> str:
+    return 'paren' if ch in '（）()' else 'square'
+
+
+def _reversed_dim_values(reversed_text: str) -> list:
+    """From a reversed rotated dim word, return [(value:int, style:str|None), …].
+
+    style is 'square' for [..], 'paren' for (..), None for a plain number.
+    """
+    res = []
+    for m in re.finditer(r'(\[|\()\s*([0-9,]+)\s*(\]|\))', reversed_text):
+        try:
+            res.append((int(m.group(2).replace(',', '')), _bracket_style(m.group(1))))
+        except ValueError:
+            pass
+    if not res:
+        s = reversed_text.replace(',', '')
+        if re.fullmatch(r'[0-9]+', s):
+            res.append((int(s), None))
+    return res
+
+
+# Cover/blinding/はかま dimension values that mark the start of the base region —
+# everything ABOVE them in the chain is the 天端 depth.
+_BASE_DIM_VALUES = {30, 70, 100, 250}
+
+
+def _section_tengan(region: list, sum_if_no_total: bool) -> Optional[int]:
+    """region: [(value, y), …] same-style dims ABOVE the base. Return 天端 mm or None.
+
+    The 天端 is the GL-to-foundation-top distance. How it is read from the chain:
+      • A labelled total — a value V equal to the sum of two other segments stacked on
+        it (e.g. 1,000 = 675+325, 650 = 200+450) — IS the whole 天端 span → use V.
+      • No labelled total:
+          - PLAIN segments (sum_if_no_total=False): take only the TOP segment from ▽GL.
+            F1C's chain is 200 then 300 → 天端 = 200; the 300 is the はかま/body BELOW
+            the foundation top, not part of 天端. Summing would over-count (→500).
+          - BRACKET-NOTE segments (sum_if_no_total=True): the note's bracketed numbers
+            ARE the 天端 sub-segments, so SUM them. F6A has only "(325) (325)" with no
+            total drawn → 天端 = 325+325 = 650 (= the plain siblings' 650 total).
+    Values outside a plausible range are dropped as parse garbage ("200700", etc.).
+    """
+    items = [(v, y) for v, y in region if 30 <= v <= 1600]
+    if not items:
+        return None
+    vals = [v for v, _y in items]
+    totals = [V for V in vals
+              if any(a + b == V and a != V and b != V for a in vals for b in vals)]
+    if totals:
+        result = max(totals)
+    elif sum_if_no_total:
+        result = sum(vals)                            # bracket note: sum the sub-segments
+    else:
+        result = min(items, key=lambda t: t[1])[0]    # plain: topmost segment from ▽GL
+    return result if 30 <= result <= 2000 else None
+
+
+def parse_section_elevations(pdf, explicit: dict) -> dict:
+    """Per-type 基礎天端高さ read deterministically from 基礎断面 cross-sections.
+
+    pdf: an ALREADY-OPEN pdfplumber document. Pass the open doc (not bytes) so this
+    reuses pages the pipeline has already parsed — reopening + re-parsing a dense CAD
+    PDF here costs tens of seconds (the page.chars/layout pass), doubling latency.
+
+    explicit: the {CODE: negative_mm} floor-plan map — kept authoritative; this only
+    FILLS types it does not already cover (never overrides a 伏図 annotation).
+
+    Each "<codes> 基礎断面" has a left dimension chain ▽GL → foundation top → base.
+    The 天端 (see _section_tengan) is read from the chain segments above the base
+    region (cover 30/70/100, はかま 250). Every non-note type in the title gets the
+    plain value; a bracket-note owner gets the same-style ([ ] vs ( )) value.
+    Returns {CODE: negative_mm}.
+    """
+    result: dict = {}
+    try:
+        for page in pdf.pages:
+            # Pages are already warm (parsed earlier), so extract_text is cheap here.
+            page_text = page.extract_text() or ""
+            if '基礎断面' not in page_text:
+                continue
+            owner_style = {
+                m.group(2).upper(): _bracket_style(m.group(1))
+                for m in _BRACKET_NOTE_RE.finditer(page_text)
+            }
+
+            words = page.extract_words(extra_attrs=['upright'])
+
+            # Section titles: "<codes> 基礎断面"
+            sections = []  # (codes:list[str], title_x0, title_top)
+            for w in words:
+                if '基礎断面' not in w['text']:
+                    continue
+                m = _SECTION_TITLE_RE.search(w['text'])
+                codes_txt = m.group(1) if m else None
+                if not codes_txt:  # code list is a separate word to the left
+                    left = [v for v in words
+                            if abs(v['top'] - w['top']) < 4 and v['x1'] <= w['x0'] + 2
+                            and re.match(r'^F\d', v['text'])]
+                    if left:
+                        codes_txt = max(left, key=lambda v: v['x0'])['text']
+                if codes_txt:
+                    codes = [c.upper() for c in _CODE_SPLIT_RE.split(codes_txt)
+                             if re.match(r'^F\d', c)]
+                    if codes:
+                        sections.append((codes, w['x0'], w['top']))
+
+            for codes, tx, ty in sections:
+                # The left dimension chain sits below-and-left of the section title.
+                chain = []  # (value, style, y_centroid)
+                for w in words:
+                    xc = (w['x0'] + w['x1']) / 2
+                    if not (tx - 160 <= xc <= tx - 50) or not (ty < w['top'] < ty + 160):
+                        continue
+                    if not w.get('upright') and re.search(r'[0-9]', w['text']):
+                        for val, style in _reversed_dim_values(w['text'][::-1]):
+                            chain.append((val, style, (w['top'] + w['bottom']) / 2))
+                if not chain:
+                    continue
+
+                # Base region begins at the first cover/はかま plain dim; the 天端
+                # depth is the chain above it.
+                base_ys = [y for v, s, y in chain
+                           if s is None and v in _BASE_DIM_VALUES]
+                base_y = min(base_ys) if base_ys else float('inf')
+
+                def _region(style):
+                    return [(v, y) for v, s, y in chain if s == style and y < base_y]
+
+                plain_t = _section_tengan(_region(None), sum_if_no_total=False)
+                if plain_t is not None:
+                    # Emit for ALL non-note codes (even those with a 伏図 value) so the
+                    # caller can compare and flag floor-plan vs section conflicts. The
+                    # caller keeps the 伏図 value as authoritative (setdefault).
+                    for c in codes:
+                        if c not in owner_style and c not in result:
+                            result[c] = -plain_t
+                            print(f"[SectionElev] [{c}] {codes} 天端=GL-{plain_t}")
+
+                for owner, style in owner_style.items():
+                    if owner not in codes:
+                        continue
+                    bt = _section_tengan(_region(style), sum_if_no_total=True)
+                    if bt is not None:
+                        result[owner] = -bt
+                        print(f"[SectionElev] [{owner}] {codes} {style} 天端=GL-{bt}")
+    except Exception as e:
+        print(f"[SectionElev] failed: {e}")
+    return result
+
+
 # Combined-type splitter — a single F-code token (F11, F23A, F132 …)
 _FCODE_RE = re.compile(r'^F\d+[A-Za-z0-9]*$')
 
@@ -244,9 +485,16 @@ def resolve_elevations_for_list(foundation_list: list, elev_data: ElevationData)
     """Apply text-layer elevations to foundation items, splitting combined rows when needed.
 
     Priority:
-      1. Explicit annotation (floor-plan or cross-section)
-      2. Project-wide default
-      3. Keep existing Gemini value (no override)
+      1. Explicit value — floor-plan annotation, cross-section text, OR a 断面
+         dimension read by parse_section_elevations (merged into elev_data.explicit).
+      2. Project-wide default (特記無き…GL-XXX) — the drawing's own rule for any
+         foundation not otherwise specified.
+      3. Keep existing value (no override) only when neither exists.
+
+    Order matters: section dimensions are merged into `explicit` BEFORE this runs, so
+    a deep foundation read from its 断面 (e.g. F3D = GL-1,000) wins over the default,
+    while genuinely-unspecified shallow foundations still get the default (≈ their
+    real near-GL top) — every foundation ends up with a value, none left blank.
 
     FW/FG beams are skipped — they never have floor-plan annotations.
     Combined rows like "F4, F4A" are SPLIT when parts resolve to different elevations.
@@ -260,7 +508,7 @@ def resolve_elevations_for_list(foundation_list: list, elev_data: ElevationData)
 
         parts = [p.strip().upper() for p in re.split(r'[,、，\s]+', item.type) if p.strip()]
 
-        # Compute effective elevation per part
+        # Effective elevation per part: explicit (incl. 断面) > project default > keep.
         part_elevs: dict = {}
         for p in parts:
             if p in elev_data.explicit:
@@ -268,7 +516,7 @@ def resolve_elevations_for_list(foundation_list: list, elev_data: ElevationData)
             elif elev_data.default is not None:
                 part_elevs[p] = elev_data.default
             else:
-                part_elevs[p] = None  # no text-layer override; keep Gemini value
+                part_elevs[p] = None
 
         known_vals = [v for v in part_elevs.values() if v is not None]
 

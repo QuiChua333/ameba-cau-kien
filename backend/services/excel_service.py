@@ -15,6 +15,9 @@ from models import FoundationItem, PitHoleItem
 
 TEMPLATE_PATH = Path(__file__).parent.parent / "templates" / "計算書(施工) - DD.xlsx"
 
+# Note: a floor-plan vs section 天端 conflict (FoundationItem.top_elevation_alt) is
+# surfaced in the web UI only. The Excel export stays plain — no fill, no note.
+
 # Mapping: Gemini classification → Excel "Loại Móng" string
 CLASSIFICATION_MAP = {
     "DD":    "TNF-DD",
@@ -147,12 +150,12 @@ def fill_excel(
         ws.cell(row=row, column=4).value = loai_mong
 
         # F — Cao độ mặt trên cấu kiện H1 (top_elevation, mm)
-        if item.top_elevation is not None:
-            ws.cell(row=row, column=6).value = item.top_elevation
-
         # G — H2 (for DD type, same as H1 unless we have specific data)
+        # The 伏図 value is used as-is. A floor-plan/section conflict (top_elevation_alt)
+        # is flagged in the web UI only — the Excel file stays plain (no fill, no note).
         if item.top_elevation is not None:
-            ws.cell(row=row, column=7).value = item.top_elevation
+            ws.cell(row=row, column=6, value=item.top_elevation)
+            ws.cell(row=row, column=7, value=item.top_elevation)
 
         # H — Chiều cao cấu kiện D (main height)
         # I — Chiều cao D2 Daike (only for D / DD)
