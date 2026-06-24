@@ -27,18 +27,20 @@ from models import ItemRegion
 
 _TYPE_TOKEN_RE = re.compile(r'F\d+[A-Z0-9]*')
 
-# Match a title like "F1,F2,F5 基礎断面", "F1 基礎断面", or "F7~F9 基礎断面".
+# Match a title like "F1,F2,F5 基礎断面", "F1 基礎断面", "F7~F9 基礎断面", and also the
+# "基礎"-less variant some firms use in the リスト ("F1,F1A 断面図", "F2B 平面図").
 # Note: pdfplumber concatenates words from same line with a space between them.
-# We allow optional whitespace before 基礎. Separator class includes list
-# delimiters (, 、 ，) AND range delimiters (~ ～ ・ /); ranges like "F7~F9" are
-# expanded to every type in between by _expand_types(). The continuation token
-# uses an optional F (F?\d+) so "F7~9" works as well as "F7~F9".
+# 基礎 is optional and a trailing 図 is allowed. The F-code prefix is required, so a
+# bare "A-A断面図" or "ピット断面図" (no F\d code) never matches. Separator class
+# includes list delimiters (, 、 ，) AND range delimiters (~ ～ ・ /); ranges like
+# "F7~F9" are expanded by _expand_types(). The continuation token uses an optional
+# F (F?\d+) so "F7~9" works as well as "F7~F9".
 _FOUNDATION_SECTION_RE = re.compile(
-    r'(F\d+[A-Z0-9]*(?:[\s,、，~～・/]+F?\d+[A-Z0-9]*)*)\s*基礎\s*断面',
+    r'(F\d+[A-Z0-9]*(?:[\s,、，~～・/]+F?\d+[A-Z0-9]*)*)\s*(?:基礎\s*)?断面図?',
     re.UNICODE,
 )
 _FOUNDATION_PLAN_RE = re.compile(
-    r'(F\d+[A-Z0-9]*(?:[\s,、，~～・/]+F?\d+[A-Z0-9]*)*)\s*基礎\s*平面',
+    r'(F\d+[A-Z0-9]*(?:[\s,、，~～・/]+F?\d+[A-Z0-9]*)*)\s*(?:基礎\s*)?平面図?',
     re.UNICODE,
 )
 

@@ -455,6 +455,66 @@ def _build_table_from_words(page, bbox,
                 return i
         return -1
 
+    # ── Type-anchored row bands ────────────────────────────────────────────────
+    # Every foundation row carries a 基礎符号 code (F1, F1A, "F2,F2A"…) in the type
+    # column, regularly spaced. Gap-clustering on ALL word y-centroids chains
+    # tightly-packed rows together (their 2-line ベース筋/備考 cells fill the gaps),
+    # merging e.g. F1+F1A+F1B into one row with Lx=0 and a run-on D. Banding on the
+    # type-code anchors instead keeps each foundation on its own row. Falls back to
+    # the gap-cluster bands when there is no clean column of codes.
+    type_words = [w for w in words if re.match(r'^F\d', (w["text"] or "").strip())]
+    col_code_count: dict = {}
+    for w in type_words:
+        c = _col((w["x0"] + w["x1"]) / 2)
+        if c >= 0:
+            col_code_count[c] = col_code_count.get(c, 0) + 1
+    # Schedule type columns carry MANY codes (≥3); sparse columns are section-drawing
+    # captions ("F2B 平面図") and must not act as anchors.
+    anchor_cols = {c for c, n in col_code_count.items() if n >= 3}
+    anchor_ys = sorted((w["top"] + w["bottom"]) / 2 for w in type_words
+                       if _col((w["x0"] + w["x1"]) / 2) in anchor_cols)
+
+    if len(anchor_ys) >= 3:
+        gaps = sorted(anchor_ys[i + 1] - anchor_ys[i]
+                      for i in range(len(anchor_ys) - 1))
+        spacing = gaps[len(gaps) // 2] or y_gap
+        # Collapse anchors that share a row (side-by-side sub-tables aligned in y).
+        groups: list = []
+        for y in anchor_ys:
+            if groups and y - groups[-1][-1] < spacing * 0.5:
+                groups[-1].append(y)
+            else:
+                groups.append([y])
+        anchors = [sum(g) / len(g) for g in groups]
+
+        # Only override the gap-cluster bands when they actually MERGE rows: i.e.
+        # several anchors fall into one gap-band. When gap-clustering already gives a
+        # distinct band per anchor (the common case), keep it untouched so files that
+        # extract correctly today don't shift. Anchor banding is the repair path only.
+        def _gap_row(yc: float) -> int:
+            for i, (lo, hi) in enumerate(row_bands):
+                if lo - y_gap <= yc <= hi + y_gap:
+                    return i
+            return -1
+        occupied = [_gap_row(a) for a in anchors]
+        merged = len(anchors) - len({i for i in occupied if i >= 0})
+
+        if len(anchors) >= 3 and merged >= 2:
+            ys_all = [(w["top"] + w["bottom"]) / 2 for w in words]
+            top_all, bot_all = min(ys_all), max(ys_all)
+            mids = [(anchors[i] + anchors[i + 1]) / 2 for i in range(len(anchors) - 1)]
+            bands: list = [(top_all - 1, anchors[0] - spacing * 0.5)]  # header band
+            prev = anchors[0] - spacing * 0.5
+            for i, a in enumerate(anchors):
+                hi = mids[i] if i < len(mids) else max(bot_all + 1, a + spacing * 0.5)
+                bands.append((prev, hi))
+                prev = hi
+            row_bands = bands
+            print(f"[TableExtract] row-merge detected ({merged}); "
+                  f"using {len(anchors)} type-code anchors for row bands")
+
+    # Anchor bands are contiguous (boundaries at anchor midpoints); gap-cluster bands
+    # have gaps between them. A small tolerance handles points exactly on a boundary.
     def _row(yc: float) -> int:
         for i, (lo, hi) in enumerate(row_bands):
             if lo - y_gap <= yc <= hi + y_gap:

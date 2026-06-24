@@ -10,8 +10,16 @@ from typing import List
 
 import openpyxl
 from openpyxl.formula.translate import Translator
+from openpyxl.worksheet.datavalidation import DataValidation
 
 from models import FoundationItem, PitHoleItem
+
+# The "Loại Móng" (column D) dropdown in the template is an Excel x14-extension list
+# validation that openpyxl silently DROPS on load (→ exported file loses the dropdown).
+# We re-add it as a standard list validation pointing at the same source range on the
+# データ sheet so the dropdown survives the export.
+_LOAI_MONG_LIST = "データ!$A$2:$A$12"
+_LOAI_MONG_COL = "D"
 
 TEMPLATE_PATH = Path(__file__).parent.parent / "templates" / "計算書(施工) - DD.xlsx"
 
@@ -183,6 +191,14 @@ def fill_excel(
 
         if pit.D is not None and pit.D > 0:
             ws.cell(row=row, column=8).value = pit.D              # H — D
+
+    # Restore the "Loại Móng" dropdown openpyxl dropped on load, covering every data
+    # row that was written (including cloned overflow rows).
+    last_data_row = DATA_START_ROW + len(items) + len(readable_pits) - 1
+    if last_data_row >= DATA_START_ROW:
+        dv = DataValidation(type="list", formula1=_LOAI_MONG_LIST, allowBlank=True)
+        dv.add(f"{_LOAI_MONG_COL}{DATA_START_ROW}:{_LOAI_MONG_COL}{last_data_row}")
+        ws.add_data_validation(dv)
 
     # Save to bytes buffer
     buf = io.BytesIO()
