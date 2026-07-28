@@ -16,18 +16,39 @@ from typing import Optional
 # Compiled patterns
 # ──────────────────────────────────────────────────────────────────────────────
 
+# Sign of a ▽GL-relative elevation. Almost every foundation top is BURIED (GL-450),
+# but a shallow one can stand proud of the ground and is then annotated GL+60 — the
+# value must keep that sign, so every GL pattern captures it instead of assuming "-".
+_MINUS_CHARS = '-－−ー'
+_SIGN_CLASS = f'[{_MINUS_CHARS}+＋±]'
+
+
+def _signed_mm(sign: str, digits: str) -> int:
+    """Signed millimetres from a captured GL sign + digit run ("−", "1,250" → -1250).
+
+    "±" is the ±0 datum marker — always zero regardless of the digits. A missing sign
+    means a depth below ▽GL (the drawn default), so it reads negative.
+    """
+    num = int(digits.replace(',', '').replace('，', ''))
+    if sign == '±':
+        return 0
+    return num if sign in ('+', '＋') else -num
+
+
 # Pattern 1 — Floor plan per-type annotations (highest priority)
 # Matches ▽*GL variants: GL, SGL, 設計GL, 設計SGL  ((?:設計)?S?GL)
-# Examples: F1A(設計GL-450)  F1(GL-1,000)  F15A(SGL-1,250)
+# Examples: F1A(設計GL-450)  F1(GL-1,000)  F15A(SGL-1,250)  F1A(設計GL+60)
 _FLOOR_PLAN_RE = re.compile(
-    r'(F\d+[A-Z0-9]*)\s*[（(](?:設計)?S?GL[-－]([0-9,，]+)[）)]',
+    rf'(F\d+[A-Z0-9]*)\s*[（(](?:設計)?S?GL\s*({_SIGN_CLASS})\s*([0-9,，]+)[）)]',
     re.UNICODE,
 )
 
 # Pattern 2 — Cross-section per-type annotations (dimension labels inside cross-section drawings)
 # Matches: (F5,F6:1,100)  (F8A:800)  (F5、F6：1,100)  （F5,F6：1,100）
+# The number is a depth BELOW ▽GL unless it carries an explicit "+" ((F5:+60)).
 _CROSS_SECTION_RE = re.compile(
-    r'[（(]\s*(F\d+[A-Za-z0-9]*(?:[,、，\s]+F\d+[A-Za-z0-9]*)*)\s*[:：]\s*([0-9,，]+)\s*[）)]',
+    rf'[（(]\s*(F\d+[A-Za-z0-9]*(?:[,、，\s]+F\d+[A-Za-z0-9]*)*)\s*[:：]\s*'
+    rf'({_SIGN_CLASS}?)\s*([0-9,，]+)\s*[）)]',
     re.UNICODE,
 )
 
@@ -36,8 +57,9 @@ _CROSS_SECTION_RE = re.compile(
 # Examples: 特記無き基礎天端高さは、設計GL-250とする
 #           特記無き基礎天端高さは、GL−200とする
 #           特記無き基礎天端高さは、SGL-465とする
+#           特記無き基礎天端高さは、設計GL+60とする
 _DEFAULT_RE = re.compile(
-    r'特記無き基礎天端高さは[、,，\s]*(?:設計)?S?GL[-－−](\d+)',
+    rf'特記無き基礎天端高さは[、,，\s]*(?:設計)?S?GL\s*({_SIGN_CLASS})\s*(\d+)',
     re.UNICODE,
 )
 
@@ -69,16 +91,15 @@ def parse_elevations(pdf_text: str) -> ElevationData:
     # Pattern 1 — floor plan annotations (highest priority, process first)
     for m in _FLOOR_PLAN_RE.finditer(pdf_text):
         code = m.group(1).strip().upper()
-        num = int(m.group(2).replace(',', '').replace('，', ''))
         if code not in data.explicit:
-            data.explicit[code] = -num
+            data.explicit[code] = _signed_mm(m.group(2), m.group(3))
 
     # Pattern 2 — cross-section per-type annotations
     for m in _CROSS_SECTION_RE.finditer(pdf_text):
         types_raw = m.group(1)
-        num_str = m.group(2).replace(',', '').replace('，', '')
         try:
-            value = -int(num_str)
+            # No sign drawn = a depth below ▽GL, so default to "-".
+            value = _signed_mm(m.group(2) or '-', m.group(3))
         except ValueError:
             continue
         for part in re.split(r'[,、，\s]+', types_raw):
@@ -90,7 +111,7 @@ def parse_elevations(pdf_text: str) -> ElevationData:
     # Pattern 3 — project default
     dm = _DEFAULT_RE.search(pdf_text)
     if dm:
-        data.default = -int(dm.group(1))
+        data.default = _signed_mm(dm.group(1), dm.group(2))
 
     print(f"[TextParse] Explicit ({len(data.explicit)}): {data.explicit}")
     print(f"[TextParse] Default: {data.default}")
@@ -215,6 +236,14 @@ def parse_pit_slab_thickness(pdf) -> dict:
 # "]000,1["); we reverse each token. A bracket note
 # 「[ ]内の数値は、F1Aの数値とする」 gives that owner the SAME-style ([ ] vs ( ))
 # chain value; the other types in the title take the plain value.
+#
+# SIGN — the ▽GL label in the section is the datum, and the chain can run either way
+# from it. Usually the foundation top is BURIED (segments below the line → 天端 is
+# NEGATIVE, GL-450). But a shallow foundation can sit PROUD of the ground: its top
+# surface is drawn ABOVE ▽GL with the gap dimensioned there (60), and then the 天端
+# is POSITIVE (GL+60). So each chain is split at the ▽GL line: any segment above it
+# wins and is emitted positive; only when nothing is drawn above the line do we read
+# the buried chain below it as before.
 
 _BRACKET_NOTE_RE = re.compile(
     r'([\[\]（）()])\s*内の数値は[\s、,]*(F\d+[A-Za-z0-9]*)\s*の数値とする',
@@ -222,6 +251,10 @@ _BRACKET_NOTE_RE = re.compile(
 )
 _SECTION_TITLE_RE = re.compile(r'(F\d+[A-Za-z0-9,、，\s]*?)\s*基礎断面', re.UNICODE)
 _CODE_SPLIT_RE = re.compile(r'[,、，\s]+')
+
+# The section's ▽GL datum label — "▽設計GL", "▽GL", "▽SGL", "▽設計SGL". Its leader
+# line runs along the label's baseline, so the word's BOTTOM edge is the datum y.
+_GL_DATUM_RE = re.compile(r'▽\s*(?:設計)?S?GL', re.UNICODE)
 
 
 def _bracket_style(ch: str) -> str:
@@ -288,14 +321,15 @@ def parse_section_elevations(pdf, explicit: dict) -> dict:
     reuses pages the pipeline has already parsed — reopening + re-parsing a dense CAD
     PDF here costs tens of seconds (the page.chars/layout pass), doubling latency.
 
-    explicit: the {CODE: negative_mm} floor-plan map — kept authoritative; this only
+    explicit: the {CODE: signed_mm} floor-plan map — kept authoritative; this only
     FILLS types it does not already cover (never overrides a 伏図 annotation).
 
     Each "<codes> 基礎断面" has a left dimension chain ▽GL → foundation top → base.
     The 天端 (see _section_tengan) is read from the chain segments above the base
     region (cover 30/70/100, はかま 250). Every non-note type in the title gets the
     plain value; a bracket-note owner gets the same-style ([ ] vs ( )) value.
-    Returns {CODE: negative_mm}.
+    Returns {CODE: signed_mm} — negative when the foundation top is buried below
+    ▽GL (the usual case, GL-450), positive when it stands above it (GL+60).
     """
     result: dict = {}
     try:
@@ -331,6 +365,17 @@ def parse_section_elevations(pdf, explicit: dict) -> dict:
                         sections.append((codes, w['x0'], w['top']))
 
             for codes, tx, ty in sections:
+                # The section's ▽GL datum — same band as the dimension chain. Its
+                # baseline splits the chain into above-GL (positive 天端) and
+                # below-GL (negative 天端) segments.
+                gl_y = float('-inf')     # no datum found → whole chain reads as buried
+                for w in words:
+                    xc = (w['x0'] + w['x1']) / 2
+                    if not (tx - 200 <= xc <= tx - 20) or not (ty < w['top'] < ty + 160):
+                        continue
+                    if w.get('upright') and _GL_DATUM_RE.search(w['text']):
+                        gl_y = w['bottom'] if gl_y == float('-inf') else min(gl_y, w['bottom'])
+
                 # The left dimension chain sits below-and-left of the section title.
                 chain = []  # (value, style, y_centroid)
                 for w in words:
@@ -343,32 +388,56 @@ def parse_section_elevations(pdf, explicit: dict) -> dict:
                 if not chain:
                     continue
 
+                above = [(v, s, y) for v, s, y in chain if y < gl_y]
+                below = [(v, s, y) for v, s, y in chain if y >= gl_y]
+
                 # Base region begins at the first cover/はかま plain dim; the 天端
-                # depth is the chain above it.
-                base_ys = [y for v, s, y in chain
+                # depth is the buried chain above it.
+                base_ys = [y for v, s, y in below
                            if s is None and v in _BASE_DIM_VALUES]
                 base_y = min(base_ys) if base_ys else float('inf')
 
-                def _region(style):
-                    return [(v, y) for v, s, y in chain if s == style and y < base_y]
+                def _tengan(style):
+                    """Signed 天端 mm for one bracket style, or None.
 
-                plain_t = _section_tengan(_region(None), sum_if_no_total=False)
+                    Above-▽GL segments win and come back POSITIVE (the foundation top
+                    stands proud of the ground, e.g. ▽設計GL +60) — they are all part
+                    of the GL→top span, so a chain without a labelled total is summed.
+                    Otherwise the buried chain below ▽GL is read as before → negative.
+                    """
+                    dn_items = [(v, y) for v, s, y in below
+                                if s == style and y < base_y]
+                    up = _section_tengan([(v, y) for v, s, y in above if s == style],
+                                         sum_if_no_total=True)
+                    if up is not None:
+                        # A labelled total that SPANS ▽GL (T = up + b, both drawn below
+                        # the line) means the chain runs from the proud surface all the
+                        # way DOWN to a buried foundation top at -b: what stands above
+                        # ▽GL is the 土間/slab, not the foundation. Read the buried leg.
+                        dn_vals = [v for v, _y in dn_items]
+                        buried = [b for b in dn_vals if (up + b) in dn_vals]
+                        return -max(buried) if buried else up
+                    dn = _section_tengan(dn_items,
+                                         sum_if_no_total=(style is not None))
+                    return -dn if dn is not None else None
+
+                plain_t = _tengan(None)
                 if plain_t is not None:
                     # Emit for ALL non-note codes (even those with a 伏図 value) so the
                     # caller can compare and flag floor-plan vs section conflicts. The
                     # caller keeps the 伏図 value as authoritative (setdefault).
                     for c in codes:
                         if c not in owner_style and c not in result:
-                            result[c] = -plain_t
-                            print(f"[SectionElev] [{c}] {codes} 天端=GL-{plain_t}")
+                            result[c] = plain_t
+                            print(f"[SectionElev] [{c}] {codes} 天端=GL{plain_t:+d}")
 
                 for owner, style in owner_style.items():
                     if owner not in codes:
                         continue
-                    bt = _section_tengan(_region(style), sum_if_no_total=True)
+                    bt = _tengan(style)
                     if bt is not None:
-                        result[owner] = -bt
-                        print(f"[SectionElev] [{owner}] {codes} {style} 天端=GL-{bt}")
+                        result[owner] = bt
+                        print(f"[SectionElev] [{owner}] {codes} {style} 天端=GL{bt:+d}")
     except Exception as e:
         print(f"[SectionElev] failed: {e}")
     return result

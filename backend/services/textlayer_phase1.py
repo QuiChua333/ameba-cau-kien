@@ -49,7 +49,8 @@ class TextLayerScanResult:
     foundation_regions: Dict[str, ItemRegion] = field(default_factory=dict)
     beam_captions: Dict[int, Dict[str, dict]] = field(default_factory=dict)
     page_scans: List[dict] = field(default_factory=list)
-    # {CODE: negative_mm} 天端 elevations read from 基礎断面 cross-sections (plain
+    # {CODE: signed_mm} 天端 elevations read from 基礎断面 cross-sections — negative
+    # below ▽GL, positive when the foundation top stands above it (plain
     # dimensions and "[ ]内の数値は" bracket notes). Computed while the PDF is open once.
     section_elevations: Dict[str, int] = field(default_factory=dict)
     # {pit_name: D_mm} floor-slab thickness read from each pit's 詳細図. Fills pits

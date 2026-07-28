@@ -125,11 +125,19 @@ ALWAYS scan it before reading any cross-section drawing.
      "F22B(SGL-1,250)"    → F22B top_elevation = -1,250
    These values are AUTHORITATIVE. Use them directly.
 
+   ⚠️ KEEP THE SIGN THAT IS WRITTEN. The annotation is usually "-" (the foundation top
+   is buried below ▽GL), but a shallow foundation can stand ABOVE the ground line and
+   is then annotated "+" — that value stays POSITIVE:
+     "F1A(設計GL+60)"     → F1A  top_elevation = +60
+     "F2(GL±0)"           → F2   top_elevation = 0
+   Never flip a "+" to "-" just because most foundations are negative.
+
 3) Find the DEFAULT elevation note (used ONLY as a last resort):
      Format A: "特記無き基礎天端高さは、設計GL-250とする" → project default = -250
      Format B: "特記無き基礎天端高さは、GL−200とする"    → project default = -200
      Format C: "特記無き基礎天端高さは、SGL-465とする"    → project default = -465
-   (Any *GL prefix variant is valid — GL, SGL, 設計GL, 設計SGL)
+     Format D: "特記無き基礎天端高さは、設計GL+60とする"  → project default = +60
+   (Any *GL prefix variant is valid — GL, SGL, 設計GL, 設計SGL; keep the written sign)
    ⚠️ Apply this default ONLY to foundations that have NO explicit annotation on the
    floor plan AND whose cross-section drawing cannot be found or read.
    If a foundation has an explicit floor plan annotation, ALWAYS use that, never the default.
@@ -211,6 +219,19 @@ ALGORITHM — follow exactly in this order:
 STEP A) Find the ▽GL (or ▽SGL — same meaning, SGL = 設計GL) horizontal line in the
    cross-section drawing. Treat ▽SGL exactly as ▽GL.
 
+STEP A2) DECIDE THE SIGN FROM WHICH SIDE OF THE ▽GL LINE THE DIMENSION IS DRAWN.
+   The ▽GL line is the zero datum, and the chain can run either way from it:
+   - Foundation top BELOW the ▽GL line (buried — the usual case) → NEGATIVE (e.g. -450).
+   - Foundation top ABOVE the ▽GL line (the concrete stands proud of the ground; the
+     gap is dimensioned ABOVE the line, e.g. a small "60" between ▽設計GL and the top
+     surface) → POSITIVE (top_elevation = +60).
+   ⚠️ Do NOT assume every value is negative. Look at where the dimension sits relative
+      to the ▽GL line and sign it accordingly.
+   ⚠️ CAUTION when BOTH sides are dimensioned: if the number above ▽GL is the 土間/slab
+      top (土間天端) and a labelled total spans from it down past ▽GL to the concrete
+      (e.g. above 60, total 560, leg 500 → 560 = 60 + 500), then the FOUNDATION top is
+      the buried leg → top_elevation = -500, not +60.
+
 STEP B) On the LEFT side, find the dimension from ▽GL to the FOUNDATION SLAB TOP (底盤天端).
    The "foundation slab top" is the TOP SURFACE of the horizontal footing (底盤) at the
    BOTTOM of the foundation — NOT the top of the column stub (柱型) or pedestal.
@@ -220,11 +241,14 @@ STEP B) On the LEFT side, find the dimension from ▽GL to the FOUNDATION SLAB T
    - The OUTER (leftmost) dimension chain spans: ▽GL → [large number: 800–1,500mm] → foundation slab top.
    - The INNER dimension chain shows: ▽GL → [small number: 200mm] → column stub top,
      then [medium number: 600–1,300mm] → down to the foundation slab top.
-   - The OUTER chain's single large number = top_elevation. Read it. Write as NEGATIVE.
+   - The OUTER chain's single large number = top_elevation. Read it. Write as NEGATIVE
+     (it is below ▽GL; only sign it positive when it is drawn ABOVE the line — STEP A2).
    - DO NOT use the small inner chain value (e.g. 200 = column stub top depth) as top_elevation.
 
-   ⚠️ top_elevation can be any value from -100mm to -2,000mm depending on the project.
-      There is NO "typical small value" bias. Read whatever the outer chain shows.
+   ⚠️ top_elevation can be any value from -2,000mm up to a small POSITIVE number
+      (e.g. +60) depending on the project. There is NO "typical small value" bias and
+      no "always negative" bias. Read whatever the outer chain shows, and sign it by
+      which side of the ▽GL line it is drawn on (STEP A2).
 
 STEP B2) SPECIAL RULE FOR STEPPED/TIERED FOUNDATIONS (段付基礎):
    Some foundation cross-sections have a stepped shape — a wider flat footing at the
