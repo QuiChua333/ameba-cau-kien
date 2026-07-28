@@ -15,10 +15,15 @@ All output regions are in 0–1000 image-relative coordinates (origin top-left).
 
 import re
 import io
-from typing import List, Dict, Tuple, Optional
+from typing import List, Dict, Set, Tuple, Optional
 import pdfplumber
 
 from models import ItemRegion
+from services.page_gate import relevant_pages
+
+# Text a page must contain to possibly hold a beam label block (FW panels are
+# captioned 外壁基…詳細図, FG types live in the 地中梁リスト table).
+_BEAM_PAGE_KW = ("外壁基", "地中梁", "リスト", "詳細図")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -55,9 +60,16 @@ _FW_CAPTION_RE = re.compile(
 _FG_CAPTION_RE = re.compile(r'地中梁\s*リスト', re.UNICODE)
 
 # Standalone GL elevation marker (no surrounding parens, no extra text):
-# "GL+50", "GL-20", "GL±0", "設計GL+50", "設計GL-1,250", "GL+200mm" etc.
+# "GL+50", "GL-20", "GL±0", "設計GL+50", "設計GL-1,250", "GL+200mm", "C棟GL±0" etc.
+#
+# NOTE — this is DELIBERATELY narrower than text_parser._GL_PREFIX, which accepts any
+# short prefix (including "SGL"). This regex only pre-filters candidates for the FLOOR
+# SLAB oval markers, and broadening it to "SGL" starts detecting slab markers on sheets
+# where they were previously ignored — a change to existing projects' floor lists that
+# we do not want. So accept only the classic forms plus a building-wing prefix
+# ("C棟GL"), which is what the newer sheets need. Keep them in sync only on purpose.
 _GL_MARKER_RE = re.compile(
-    r'^(?:設計)?GL\s*[+\-±]\s*[0-9,]+(?:mm)?\)?$',
+    r'^(?:設計)?(?:.棟)?GL\s*[+\-±]\s*[0-9,]+(?:mm)?\)?$',
     re.UNICODE,
 )
 
@@ -177,6 +189,24 @@ def build_page_scan(page_idx: int, page) -> dict:
         "height": float(page.height),
         "lines": _build_lines(words),
         "words": words,
+    }
+
+
+def empty_page_scan(page_idx: int, page) -> dict:
+    """Page-scan stub for a page deliberately NOT deep-parsed.
+
+    Same shape as build_page_scan but with no words or lines, so callers that
+    index page scans by page number stay aligned. Only width/height are read, and
+    those come from the page's MediaBox — no content-stream parsing, which is the
+    whole point (see textlayer_phase1._relevant_page_indices).
+    """
+    return {
+        "page_idx": page_idx,
+        "page_num": page_idx + 1,
+        "width": float(page.width),
+        "height": float(page.height),
+        "lines": [],
+        "words": [],
     }
 
 
@@ -458,10 +488,18 @@ def find_beam_labels(pdf_content: bytes, beam_types: List[str],
         else:
             queries_per_type[u] = [u]
 
-    found: Dict[str, ItemRegion] = {}
+    # Re-opening the PDF here pays the full deep parse again, so build page scans
+    # ONLY for pages that can produce a kept match: `prefer_pages` when the caller
+    # narrowed it down, otherwise pages whose text mentions a beam block at all.
+    pages = prefer_pages
+    if pages is None:
+        pages = relevant_pages(pdf_content, _BEAM_PAGE_KW, label="BeamLabels")
+
     with _open_pdfplumber(pdf_content) as pdf:
         return find_beam_labels_from_pages(
-            [build_page_scan(page_idx, page) for page_idx, page in enumerate(pdf.pages)],
+            [build_page_scan(page_idx, page)
+             for page_idx, page in enumerate(pdf.pages)
+             if pages is None or page_idx in pages],
             beam_types,
             prefer_pages=prefer_pages,
         )
@@ -560,10 +598,18 @@ def find_oval_gl_markers_from_open(pdf) -> List[dict]:
     return find_oval_gl_markers_from_cached_words(pdf, page_words)
 
 
-def find_oval_gl_markers_from_cached_words(pdf, page_words: List[List[dict]]) -> List[dict]:
-    """Oval GL-marker detection reusing caller-supplied word caches."""
+def find_oval_gl_markers_from_cached_words(pdf, page_words: List[List[dict]],
+                                           pages: Optional[Set[int]] = None) -> List[dict]:
+    """Oval GL-marker detection reusing caller-supplied word caches.
+
+    pages: 0-based indices to consider; None = every page. Pages outside the set
+    are skipped WITHOUT touching page.chars — reading it would trigger the deep
+    content-stream parse this gate exists to avoid.
+    """
     results: List[dict] = []
     for page_idx, page in enumerate(pdf.pages):
+        if pages is not None and page_idx not in pages:
+            continue
         # Cheap pre-check: GL markers carry a literal "GL" in the text layer.
         # Pages without it can't hold one — skip extract_words / curve parsing.
         page_text = "".join(c.get("text", "") for c in page.chars)
@@ -815,9 +861,18 @@ def find_pit_drawing_regions(pdf_content: bytes, pit_types: List[str]) -> Dict[s
     wanted = [t for t in dict.fromkeys(pit_types) if t and t.strip()]
     if not wanted:
         return {}
+
+    # This runs in the MAIN process and opens the PDF a second time, so it pays the
+    # full deep-parse cost again — 67s on our worst sample sheet. A pit caption is
+    # always "<name>詳細図 / 断面図 / リスト", so pages without one of those words
+    # cannot hold a caption and are skipped (see services/page_gate.py).
+    pages = relevant_pages(pdf_content, _PIT_CAPTION_KW, label="PitLocator")
+
     best: Dict[str, tuple] = {}  # type → (rank, ItemRegion); lower rank wins
     with _open_pdfplumber(pdf_content) as pdf:
         for page_idx, page in enumerate(pdf.pages):
+            if pages is not None and page_idx not in pages:
+                continue
             lines = _build_lines(page.extract_words(
                 x_tolerance=3, y_tolerance=3, keep_blank_chars=False))
             anchors = _collect_caption_anchors(lines)

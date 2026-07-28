@@ -792,27 +792,33 @@ def extract_foundation_table(pdf_bytes: bytes) -> TableExtractionResult:
         return _EMPTY_RESULT
 
 
-def extract_foundation_table_from_open(pdf) -> TableExtractionResult:
+def extract_foundation_table_from_open(pdf, pages: Optional[set] = None) -> TableExtractionResult:
     """Extract the foundation schedule from an already-open pdfplumber document.
 
     Uses find_tables() (not extract_tables()) so we also get the table bounding
     box for accurate image cropping later.
 
+    pages: 0-based page indices to consider; None = every page. Honour the caller's
+    gate — page.chars / find_tables() on a skipped page would trigger the deep
+    content-stream parse the gate exists to avoid (see
+    textlayer_phase1._relevant_page_indices).
+
     Returns a TableExtractionResult. On any failure, result.found is False
     and the caller falls back to Gemini's vision-based extraction.
     """
     try:
-        pages = list(enumerate(pdf.pages, start=1))
+        candidate_pages = [(n, p) for n, p in enumerate(pdf.pages, start=1)
+                           if pages is None or (n - 1) in pages]
 
         # Pre-filter: only run the expensive find_tables() on pages whose text
         # layer mentions a foundation-table header keyword. Fall back to every
         # page if none match (e.g. outlined/vectorised header text), so we never
         # regress to "found nothing" on an unusual sheet.
         candidates = [
-            (n, p) for (n, p) in pages
+            (n, p) for (n, p) in candidate_pages
             if any(k in _page_chars_text(p) for k in _TABLE_PAGE_KEYWORDS)
         ]
-        scan = candidates if candidates else pages
+        scan = candidates if candidates else candidate_pages
 
         # A page's find_tables() often returns several overlapping regions — the
         # tight schedule box AND a page-wide box that also swallows the cross-section
@@ -883,6 +889,19 @@ def extract_foundation_table_from_open(pdf) -> TableExtractionResult:
             return best
     except Exception as e:
         print(f"[TableExtract] Error: {e}")
+
+    # FALLBACK — newer sheets have no page-wide schedule at all: each foundation
+    # carries its own single-row mini table (基礎符号/Lx/Ly/D/ベース筋, no 備考)
+    # under its 基礎断面. Only reached when the classic layout yielded nothing, so
+    # documents that DO have a schedule keep their existing behaviour exactly.
+    print("[TableExtract] No page-wide schedule — trying per-foundation mini tables.")
+    try:
+        from services.foundation_list_v2 import extract_per_foundation_list
+        v2 = extract_per_foundation_list(pdf, pages=pages)
+        if v2.items:
+            return v2
+    except Exception as e:
+        print(f"[TableExtract] per-foundation fallback failed: {e}")
 
     print("[TableExtract] No foundation schedule found via pdfplumber.")
     return _EMPTY_RESULT

@@ -10,7 +10,7 @@ Priority when merging: floor-plan > cross-section > project default > Gemini val
 
 import re
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Optional, Set
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Compiled patterns
@@ -21,6 +21,15 @@ from typing import Optional
 # value must keep that sign, so every GL pattern captures it instead of assuming "-".
 _MINUS_CHARS = '-－−ー'
 _SIGN_CLASS = f'[{_MINUS_CHARS}+＋±]'
+
+# The datum label's prefix before "GL". Every firm brands it differently and the
+# suffix "GL" is the only stable part:
+#   GL   設計GL   SGL   設計SGL   C棟GL   A棟GL   …
+# So match "▽*GL" literally: up to 4 non-space characters (kanji wing name, 設計,
+# S, …) glued directly onto GL. Non-greedy so a bare "GL" still matches with an
+# empty prefix. Separators and brackets are excluded so the run can never swallow
+# a neighbouring token (e.g. "F1A(" or ", GL").
+_GL_PREFIX = r'[^\s（()）\[\]{}、，,:：]{0,4}?'
 
 
 def _signed_mm(sign: str, digits: str) -> int:
@@ -36,10 +45,11 @@ def _signed_mm(sign: str, digits: str) -> int:
 
 
 # Pattern 1 — Floor plan per-type annotations (highest priority)
-# Matches ▽*GL variants: GL, SGL, 設計GL, 設計SGL  ((?:設計)?S?GL)
+# Matches any ▽*GL variant: GL, SGL, 設計GL, 設計SGL, C棟GL, …  (see _GL_PREFIX)
 # Examples: F1A(設計GL-450)  F1(GL-1,000)  F15A(SGL-1,250)  F1A(設計GL+60)
+#           F1A(C棟GL-500)  F3A(C棟GL-1,100)   ← per-building-wing prefix
 _FLOOR_PLAN_RE = re.compile(
-    rf'(F\d+[A-Z0-9]*)\s*[（(](?:設計)?S?GL\s*({_SIGN_CLASS})\s*([0-9,，]+)[）)]',
+    rf'(F\d+[A-Z0-9]*)\s*[（(]{_GL_PREFIX}GL\s*({_SIGN_CLASS})\s*([0-9,，]+)[）)]',
     re.UNICODE,
 )
 
@@ -53,13 +63,14 @@ _CROSS_SECTION_RE = re.compile(
 )
 
 # Pattern 3 — Project-wide default
-# Matches ▽*GL variants: GL, SGL, 設計GL, 設計SGL  ((?:設計)?S?GL)
+# Matches any ▽*GL variant: GL, SGL, 設計GL, 設計SGL, C棟GL, …  (see _GL_PREFIX)
 # Examples: 特記無き基礎天端高さは、設計GL-250とする
 #           特記無き基礎天端高さは、GL−200とする
 #           特記無き基礎天端高さは、SGL-465とする
 #           特記無き基礎天端高さは、設計GL+60とする
+#           特記無き基礎天端高さは、C棟GL+650とする   ← new-template sheets
 _DEFAULT_RE = re.compile(
-    rf'特記無き基礎天端高さは[、,，\s]*(?:設計)?S?GL\s*({_SIGN_CLASS})\s*(\d+)',
+    rf'特記無き基礎天端高さは[、,，\s]*{_GL_PREFIX}GL\s*({_SIGN_CLASS})\s*(\d+)',
     re.UNICODE,
 )
 
@@ -127,7 +138,7 @@ def parse_elevations(pdf_text: str) -> ElevationData:
 # is authoritative and removes the vision guesswork (1,000 vs 1,200 vs 1,495).
 _PIT_REF_RE = re.compile(
     r'([0-9A-Za-z①-⑳、,]*[一-龥ァ-ヶー]+)詳細図参照\s*[（(]\s*'
-    r'底盤天端(?:設計)?S?GL[-－－]([0-9,，]+)',
+    rf'底盤天端{_GL_PREFIX}GL[{_MINUS_CHARS}]([0-9,，]+)',
     re.UNICODE,
 )
 
@@ -162,11 +173,15 @@ _PIT_DETAIL_TITLE_RE = re.compile(
 )
 
 
-def parse_pit_slab_thickness(pdf) -> dict:
+def parse_pit_slab_thickness(pdf, pages: Optional[Set[int]] = None) -> dict:
     """Read each pit's floor-slab thickness D from its 詳細図 cross-section.
 
     pdf: an ALREADY-OPEN pdfplumber document (reuse the pipeline's single open;
     reopening a dense CAD PDF costs tens of seconds).
+
+    pages: 0-based page indices to consider; None = every page. Honour the caller's
+    gate — extract_text() on a skipped page would trigger the deep content-stream
+    parse the gate exists to avoid (see textlayer_phase1._relevant_page_indices).
 
     In a pit detail the left dimension chain runs ▽GL → slab top → slab bottom →
     leveling concrete (捨てコン). Read by RELATION rather than absolute magic ranges:
@@ -183,7 +198,9 @@ def parse_pit_slab_thickness(pdf) -> dict:
     """
     result: dict = {}
     try:
-        for page in pdf.pages:
+        for page_idx, page in enumerate(pdf.pages):
+            if pages is not None and page_idx not in pages:
+                continue
             page_text = page.extract_text() or ""
             if '詳細図' not in page_text:
                 continue
@@ -252,9 +269,79 @@ _BRACKET_NOTE_RE = re.compile(
 _SECTION_TITLE_RE = re.compile(r'(F\d+[A-Za-z0-9,、，\s]*?)\s*基礎断面', re.UNICODE)
 _CODE_SPLIT_RE = re.compile(r'[,、，\s]+')
 
-# The section's ▽GL datum label — "▽設計GL", "▽GL", "▽SGL", "▽設計SGL". Its leader
-# line runs along the label's baseline, so the word's BOTTOM edge is the datum y.
-_GL_DATUM_RE = re.compile(r'▽\s*(?:設計)?S?GL', re.UNICODE)
+# The section's ▽GL datum label — "▽設計GL", "▽GL", "▽SGL", "▽設計SGL", "▽C棟GL", …
+# Its leader line runs along the label's baseline, so the word's BOTTOM edge is the
+# datum y. Only "GL" is matched, never "FL": new-template sections draw BOTH a
+# ▽*FL (finished floor) and a ▽*GL line, and only the latter is the elevation datum.
+_GL_DATUM_RE = re.compile(rf'▽\s*{_GL_PREFIX}GL', re.UNICODE)
+
+# The explicit 天端 level markers new-template sections carry beside the dimension
+# chain. ▼基礎天端 is the foundation slab top — exactly what top_elevation measures —
+# while ▼柱型天端 is the column-stub top ABOVE it and must never be used instead.
+_TENGAN_MARKER_RE = re.compile(r'[▼▽]\s*基礎天端', re.UNICODE)
+# ▽*FL — the finished-floor datum drawn ABOVE ▽*GL in these sections. Needed only
+# for the proud-foundation case (see _marker_tengan).
+_FL_DATUM_RE = re.compile(rf'▽\s*{_GL_PREFIX}FL', re.UNICODE)
+
+# Plausible range for a single dimension-chain segment (mm). Wide enough for a
+# 2 m-deep pit leg, tight enough to reject parse garbage — notably the run-together
+# words pdfplumber emits when two rotated dims touch ("150"+"350" → 150350).
+_SEG_MIN, _SEG_MAX = 30, 4000
+
+
+def _segment_near(chain: list, y_mid: float, span: float) -> Optional[int]:
+    """The chain segment that dimensions the span centred on `y_mid`.
+
+    A rotated dimension's text is centred on the span it measures, so the segment
+    labelling a known gap is the one whose text centre sits at that gap's midpoint.
+    The tolerance scales with the span so a long gap is not matched by a tiny
+    neighbouring dim, and a short gap stays tight.
+
+    When several land inside the window, the OUTERMOST (smallest x) wins: nested
+    chains put the whole span on the outside and its subdivisions inside, so the
+    outer number is the total we want.
+    """
+    tol = max(4.0, span * 0.25)
+    cands = [(x, abs(y - y_mid), v)
+             for v, _s, y, x in chain
+             if abs(y - y_mid) <= tol and _SEG_MIN <= v <= _SEG_MAX]
+    if not cands:
+        return None
+    cands.sort()
+    return cands[0][2]
+
+
+def _marker_tengan(chain: list, gl_y: float, tengan_y: float,
+                   fl_y: Optional[float]) -> Optional[int]:
+    """Signed 天端 mm from the explicit ▽*GL / ▼基礎天端 / ▽*FL level markers.
+
+    Newer sections label the levels themselves, which removes every guess the
+    magnitude-based heuristics have to make: the SIGN is simply which side of
+    ▽*GL the ▼基礎天端 marker sits on, and the MAGNITUDE is the chain segment
+    spanning between the two.
+
+      • 基礎天端 BELOW ▽GL (buried — the usual case): that gap is dimensioned
+        directly, so read the segment centred on it → negative.
+      • 基礎天端 ABOVE ▽GL (the concrete stands proud of the ground): these sheets
+        do NOT dimension the GL→天端 gap; they dimension ▽FL→▽GL and ▽FL→天端
+        from the floor datum instead. Derive it: 天端 = (FL→GL) − (FL→天端) → positive.
+
+    Returns None when the needed segments can't be identified — the caller then
+    falls back to the magnitude heuristics, and ultimately to the project default
+    note, rather than emitting a number that was never drawn.
+    """
+    if tengan_y > gl_y:
+        span = tengan_y - gl_y
+        v = _segment_near(chain, (gl_y + tengan_y) / 2, span)
+        return -v if v is not None else None
+
+    if fl_y is None or fl_y >= gl_y:
+        return None
+    fl_to_gl = _segment_near(chain, (fl_y + gl_y) / 2, gl_y - fl_y)
+    fl_to_tengan = _segment_near(chain, (fl_y + tengan_y) / 2, tengan_y - fl_y)
+    if fl_to_gl is None or fl_to_tengan is None or fl_to_gl <= fl_to_tengan:
+        return None
+    return fl_to_gl - fl_to_tengan
 
 
 def _bracket_style(ch: str) -> str:
@@ -314,7 +401,8 @@ def _section_tengan(region: list, sum_if_no_total: bool) -> Optional[int]:
     return result if 30 <= result <= 2000 else None
 
 
-def parse_section_elevations(pdf, explicit: dict) -> dict:
+def parse_section_elevations(pdf, explicit: dict,
+                             pages: Optional[Set[int]] = None) -> dict:
     """Per-type 基礎天端高さ read deterministically from 基礎断面 cross-sections.
 
     pdf: an ALREADY-OPEN pdfplumber document. Pass the open doc (not bytes) so this
@@ -323,6 +411,10 @@ def parse_section_elevations(pdf, explicit: dict) -> dict:
 
     explicit: the {CODE: signed_mm} floor-plan map — kept authoritative; this only
     FILLS types it does not already cover (never overrides a 伏図 annotation).
+
+    pages: 0-based page indices to consider; None = every page. Honour the caller's
+    gate — extract_text() on a skipped page would trigger the deep content-stream
+    parse the gate exists to avoid (see textlayer_phase1._relevant_page_indices).
 
     Each "<codes> 基礎断面" has a left dimension chain ▽GL → foundation top → base.
     The 天端 (see _section_tengan) is read from the chain segments above the base
@@ -333,7 +425,9 @@ def parse_section_elevations(pdf, explicit: dict) -> dict:
     """
     result: dict = {}
     try:
-        for page in pdf.pages:
+        for page_idx, page in enumerate(pdf.pages):
+            if pages is not None and page_idx not in pages:
+                continue
             # Pages are already warm (parsed earlier), so extract_text is cheap here.
             page_text = page.extract_text() or ""
             if '基礎断面' not in page_text:
@@ -369,24 +463,53 @@ def parse_section_elevations(pdf, explicit: dict) -> dict:
                 # baseline splits the chain into above-GL (positive 天端) and
                 # below-GL (negative 天端) segments.
                 gl_y = float('-inf')     # no datum found → whole chain reads as buried
+                fl_y = None              # ▽*FL floor datum, when the sheet draws one
+                tengan_y = None          # ▼基礎天端 level marker, when present
                 for w in words:
                     xc = (w['x0'] + w['x1']) / 2
                     if not (tx - 200 <= xc <= tx - 20) or not (ty < w['top'] < ty + 160):
                         continue
-                    if w.get('upright') and _GL_DATUM_RE.search(w['text']):
+                    if not w.get('upright'):
+                        continue
+                    if _GL_DATUM_RE.search(w['text']):
                         gl_y = w['bottom'] if gl_y == float('-inf') else min(gl_y, w['bottom'])
+                    elif _FL_DATUM_RE.search(w['text']):
+                        fl_y = w['bottom'] if fl_y is None else min(fl_y, w['bottom'])
+                    elif _TENGAN_MARKER_RE.search(w['text']):
+                        # Several sub-sections can share the band; the foundation slab
+                        # top is the LOWEST 基礎天端 marker (a higher one belongs to a
+                        # shallower neighbour panel).
+                        tengan_y = w['bottom'] if tengan_y is None else max(tengan_y, w['bottom'])
 
                 # The left dimension chain sits below-and-left of the section title.
-                chain = []  # (value, style, y_centroid)
+                chain = []   # (value, style, y_centroid, x_centroid)
                 for w in words:
                     xc = (w['x0'] + w['x1']) / 2
                     if not (tx - 160 <= xc <= tx - 50) or not (ty < w['top'] < ty + 160):
                         continue
                     if not w.get('upright') and re.search(r'[0-9]', w['text']):
                         for val, style in _reversed_dim_values(w['text'][::-1]):
-                            chain.append((val, style, (w['top'] + w['bottom']) / 2))
+                            chain.append((val, style, (w['top'] + w['bottom']) / 2, xc))
                 if not chain:
                     continue
+
+                # ── Preferred path: explicit level markers ─────────────────────
+                # When the section labels ▼基礎天端 the level is stated outright, so
+                # read it geometrically instead of inferring from dim magnitudes.
+                # Older sheets carry no such marker and skip straight to the
+                # heuristics below, so their results are unchanged.
+                marker_t = None
+                if tengan_y is not None and gl_y != float('-inf'):
+                    marker_t = _marker_tengan(chain, gl_y, tengan_y, fl_y)
+                    if marker_t is not None:
+                        for c in codes:
+                            if c not in owner_style and c not in result:
+                                result[c] = marker_t
+                                print(f"[SectionElev] [{c}] {codes} 天端=GL{marker_t:+d} (▼基礎天端)")
+                        if not owner_style:
+                            continue
+
+                chain = [(v, s, y) for v, s, y, _x in chain]
 
                 above = [(v, s, y) for v, s, y in chain if y < gl_y]
                 below = [(v, s, y) for v, s, y in chain if y >= gl_y]

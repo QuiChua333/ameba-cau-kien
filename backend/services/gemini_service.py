@@ -70,24 +70,117 @@ from services.drawing_locator import (
 PROMPT = """
 Analyze the provided images of Japanese construction drawings carefully.
 
-STEP 1: FIND THE CORRECT TABLE.
-- Scan all images to find a table specifically titled "Foundation List", "Foundation Schedule", "基礎リスト", or "基礎符号".
-- This table will have columns for Foundation Type (F1, F2...), Dimensions (Lx, Ly, D), and Rebar (ベース筋).
-- Ignore other schedules (e.g., Column List, Beam List) or floor plans.
+STEP 1: FIND THE FOUNDATION DATA — TWO SHEET LAYOUTS EXIST.
 
-STEP 2: EXTRACT DATA ROW BY ROW.
-- Focus ONLY on the "Foundation List" you found.
-- Read the table ROW by ROW. Do not copy values from previous rows.
-- Accurately extract the numbers for each Foundation Type (F1, F2, F3...).
-- Be very careful with dimensions (Lx, Ly). They are often different for each type.
-- Be very careful with Rebar counts (e.g., 11-D13 vs 13-D16).
+⚠️ BOTH layouts are in active use. FIRST decide which one this drawing set uses,
+then follow the matching branch in STEP 2 and STEP 3. The test is simple:
+  → Is there ONE page-wide 基礎リスト table with a 備考 (Remarks) column?
+      YES → LAYOUT A.   NO → LAYOUT B.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+LAYOUT A — ONE PAGE-WIDE FOUNDATION SCHEDULE (the classic sheet)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+A single table titled "基礎リスト" / "基礎符号" / "Foundation List" lists EVERY
+foundation, one row each, with a 備考 (Remarks) column on the right:
+
+  ┌────────┬────────┬────────┬──────────┬─────────────────┬──────────────────────┐
+  │基礎符号│Lx(mm)  │Ly(mm)  │ D(mm)    │    ベース筋      │        備考          │
+  │        │        │        │          │   ←    │    ↑   │                      │
+  ├────────┼────────┼────────┼──────────┼────────┼────────┼──────────────────────┤
+  │  F1    │ 2,400  │ 2,400  │ 900~350  │ 13-D13 │ 13-D13 │ B0x x B0y = 700x700  │
+  │        │        │        │          │        │        │ B1x x B1y = 1,800x…  │
+  │  F1A   │ 2,400  │ 2,400  │ 900~450  │ 13-D13 │ 13-D13 │ Bx x By = 900 x 900  │
+  │  F1B   │ 2,400  │ 2,400  │ 500      │ 13-D13 │ 13-D13 │          -           │
+  └────────┴────────┴────────┴──────────┴────────┴────────┴──────────────────────┘
+
+Ignore other schedules (Column List, Beam List) and floor plans.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+LAYOUT B — PER-FOUNDATION MINI TABLES (the newer sheet)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+There is NO page-wide schedule. Each foundation has its OWN block on the
+基礎リスト sheet: a title, a one-row mini table, and its cross-section drawing.
+The mini table has the SAME columns as Layout A **except there is NO 備考 column**:
+
+    F1A 基礎平面              F1A 基礎断面          ← per-type titles
+    ┌────────┬────────┬────────┬──────────┬─────────────────┐
+    │基礎符号│Lx(mm)  │Ly(mm)  │ D(mm)    │    ベース筋      │   ← no 備考!
+    │        │        │        │          │   ←    │   ↑    │
+    ├────────┼────────┼────────┼──────────┼────────┼────────┤
+    │  F1A   │ 4,600  │ 4,600  │1,100~250 │ 46-D16 │ 46-D16 │   ← ONE row only
+    └────────┴────────┴────────┴──────────┴────────┴────────┘
+                  [cross-section drawing]
+                        1,600
+                        3,600                ← bottom dimension stack
+                        4,600                  (see STEP 3, LAYOUT B)
+
+Several such blocks sit on one sheet, stacked vertically and side by side
+(e.g. F1 | F3 on the top row, F1A | F3A below, F2 | F4 below that).
+
+STEP 2: EXTRACT DATA.
+
+▶ LAYOUT A — read the schedule ROW by ROW:
+  - Focus ONLY on the "Foundation List" you found.
+  - Do not copy values from previous rows.
+  - Be very careful with dimensions (Lx, Ly) — they differ for each type.
+  - Be very careful with Rebar counts (e.g., 11-D13 vs 13-D16).
+
+▶ LAYOUT B — emit ONE FoundationItem per MINI TABLE:
+  - Scan the WHOLE sheet and find EVERY mini table. Do not stop after the first —
+    a sheet typically holds 4–8 of them, and there may be more than one such sheet.
+  - Read each mini table's single data row: type, Lx, Ly, D, and the two ベース筋
+    specs (← = rebar_x, ↑ = rebar_y).
+  - D is often a taper range written "1,100～250" — keep BOTH numbers as "1100~250".
+    A flat footing has a single D ("800").
+  - Set remarks to "" (this layout has no 備考 column). Do NOT invent remarks.
+  - Read each block's values ONLY from inside that block. The neighbouring block's
+    mini table and drawing are a DIFFERENT foundation — never mix their numbers.
 
 STEP 3: CLASSIFY FOUNDATION TYPE (CRITICAL).
-For each valid foundation row (F1, F2...), analyze the "Remarks" (備考) column content:
-- Count how many times a "B...x...B" formula appears (e.g., "Bx x By" or "B1x x B1y").
-- Rule 1 (DD): If count >= 2 (e.g., both "Bx x By..." AND "B1x x B1y..."), classify as "DD".
-- Rule 2 (D): If count == 1 (e.g., only "Bx x By..."), classify as "D".
-- Rule 3 (TNF): If count == 0 (empty, "-", or text without formulas), classify as "TNF".
+
+The classification counts how many stepped tiers the footing has:
+  TNF = a flat slab (no step) · D = one step · DD = two steps.
+How you COUNT depends on the layout.
+
+▶ LAYOUT A — count "B...x x B...y" formulas in the 備考 (Remarks) column:
+  - Rule 1 (DD): count >= 2 (e.g. both "B0x x B0y = …" AND "B1x x B1y = …") → "DD".
+  - Rule 2 (D):  count == 1 (e.g. only "Bx x By = …")                       → "D".
+  - Rule 3 (TNF): count == 0 (empty, "-", or text without formulas)         → "TNF".
+  ⚠️ When a 備考 column exists it is AUTHORITATIVE — use it, not the drawing.
+
+▶ LAYOUT B — there is no 備考 column, so COUNT THE VALUES IN THE BOTTOM
+  DIMENSION STACK beneath that foundation's own drawing:
+
+  Under each cross-section (and under its 基礎平面 plan view) sits a stack of
+  horizontal width dimensions, each on its own dimension line, growing wider
+  downward. The BOTTOM (widest) one equals that foundation's Lx.
+
+      1,600     ← innermost tier width      ┐
+      3,600     ← middle tier width          │ 3 values → "DD"
+      4,600     ← full footing width (= Lx)  ┘
+
+  - 3 values  → "DD"    (two steps: e.g. 1,600 / 3,600 / 4,600)
+  - 2 values  → "D"     (one step:  e.g. 1,600 / 4,600)
+  - 1 value   → "TNF"   (flat slab: e.g. just 5,000)
+
+  ✅ SELF-CHECK — the LAST (bottom, largest) value in the stack MUST equal the Lx
+     you read from that block's mini table. If it does not, you are looking at the
+     wrong stack (a neighbouring block's, or a rebar/grid dimension). Find the
+     right one before counting.
+  ✅ CROSS-CHECK with D: a tapered D ("1,100～250") means the footing is stepped →
+     expect "D" or "DD". A single flat D ("800") usually means "TNF".
+  ⛔ Do NOT count vertical dimensions, the left-side depth chain, rebar spacing
+     numbers, or the 地盤改良 (ground improvement) extents.
+  ⛔ Do NOT count the same stack twice: the 基礎平面 and 基礎断面 views of ONE
+     foundation show the SAME stack. Count the values in one view, not both.
+
+  WORKED EXAMPLES — LAYOUT B:
+    F1A: mini table Lx=4,600 · stack 1,600 / 3,600 / 4,600 (bottom = 4,600 = Lx ✓)
+         → 3 values → classification = "DD"  ✓
+    F3A: mini table Lx=5,000 · stack 5,000 only (bottom = 5,000 = Lx ✓), D = 800 flat
+         → 1 value → classification = "TNF"  ✓
+    ⛔ WRONG: classifying F3A as "DD" because its neighbour F3 has three values.
+    ⛔ WRONG: classifying every Layout-B foundation "TNF" because there is no 備考.
 
 STEP 4: EXTRACT TOP ELEVATION FROM CROSS-SECTION DRAWINGS (CRITICAL NEW STEP).
 
@@ -101,18 +194,27 @@ PRE-STEP 4A: SCAN FOUNDATION FLOOR PLAN FOR EXPLICIT ANNOTATIONS (HIGHEST PRIORI
 The 基礎伏図 (Foundation Floor Plan) is THE MOST RELIABLE source for top_elevation.
 ALWAYS scan it before reading any cross-section drawing.
 
+━━━ THE ▽*GL PREFIX — READ THIS FIRST, IT APPLIES EVERYWHERE BELOW ━━━
+Every firm brands its ground-line datum differently. "GL" is the only stable part;
+whatever is glued in front of it is just a label and carries NO meaning for you:
+     GL      設計GL      SGL      設計SGL      C棟GL      A棟GL      B棟GL
+Pattern: ▽*GL — "*" is any short prefix (nothing, S, 設計, 設計S, or a building-wing
+name such as C棟). TREAT THEM ALL AS THE SAME ▽GL DATUM, in floor-plan annotations,
+in default notes, and on cross-section datum lines.
+⚠️ But NEVER confuse ▽*GL with ▽*FL. "*FL" (e.g. ▽C棟FL, 設計FL) is the FINISHED
+   FLOOR line, which sits ABOVE ▽*GL. Only ▽*GL is the elevation datum.
+
 1) Find the floor plan note (any format is valid):
      "基礎符号(設計GL-***)の(　)内数値は、基礎天端高さを示す"
      "基礎符号(GL-***)の(　)内数値は、基礎天端高さを示す"
      "基礎符号(SGL-***)の(　)内数値は、基礎天端高さを示す"
-   ⚠️ The GL prefix varies by project. Accept ANY of: GL, SGL, 設計GL, 設計SGL.
-   Pattern: ▽*GL where * can be nothing, S, 設計, or 設計S.
+     "基礎符号(C棟GL-***)の(　)内数値は、基礎天端高さを示す"
    This confirms that the "(*GL-XXX)" value next to each foundation symbol
    = the foundation SLAB TOP elevation (底盤天端高さ).
 
 2) Collect ALL explicit per-foundation annotations from the floor plan.
    These appear as "(*GL-XXX)" immediately after the foundation code.
-   Accept any GL prefix variant (GL, SGL, 設計GL, 設計SGL).
+   Accept any GL prefix variant (GL, SGL, 設計GL, 設計SGL, C棟GL, …).
    Examples:
      "F1(GL-1,000)"       → F1   top_elevation = -1,000
      "F2B(GL-1,250)"      → F2B  top_elevation = -1,250
@@ -123,6 +225,8 @@ ALWAYS scan it before reading any cross-section drawing.
      "F15A(SGL-1,250)"    → F15A top_elevation = -1,250   ← SGL = 設計GL
      "F115(SGL-1,150)"    → F115 top_elevation = -1,150
      "F22B(SGL-1,250)"    → F22B top_elevation = -1,250
+     "F1A(C棟GL-500)"     → F1A  top_elevation = -500     ← C棟GL = per-wing GL
+     "F3A(C棟GL-1,100)"   → F3A  top_elevation = -1,100
    These values are AUTHORITATIVE. Use them directly.
 
    ⚠️ KEEP THE SIGN THAT IS WRITTEN. The annotation is usually "-" (the foundation top
@@ -137,7 +241,10 @@ ALWAYS scan it before reading any cross-section drawing.
      Format B: "特記無き基礎天端高さは、GL−200とする"    → project default = -200
      Format C: "特記無き基礎天端高さは、SGL-465とする"    → project default = -465
      Format D: "特記無き基礎天端高さは、設計GL+60とする"  → project default = +60
-   (Any *GL prefix variant is valid — GL, SGL, 設計GL, 設計SGL; keep the written sign)
+     Format E: "特記無き基礎天端高さは、C棟GL+650とする" → project default = +650
+   (Any *GL prefix variant is valid — GL, SGL, 設計GL, 設計SGL, C棟GL; keep the sign)
+   ⚠️ A POSITIVE default is real, not a typo: on some sites the foundation top sits
+      ABOVE the ground line. Keep the "+" exactly as written.
    ⚠️ Apply this default ONLY to foundations that have NO explicit annotation on the
    floor plan AND whose cross-section drawing cannot be found or read.
    If a foundation has an explicit floor plan annotation, ALWAYS use that, never the default.
@@ -216,8 +323,33 @@ These are side-view (cross-section) drawings showing the foundation in the groun
 
 ALGORITHM — follow exactly in this order:
 
-STEP A) Find the ▽GL (or ▽SGL — same meaning, SGL = 設計GL) horizontal line in the
-   cross-section drawing. Treat ▽SGL exactly as ▽GL.
+STEP A0) ★ SHORTCUT — IS THERE A "▼基礎天端" LEVEL MARKER? (CHECK THIS FIRST)
+   Newer cross-sections label the levels outright with small filled triangles:
+       ▽C棟FL     ← finished floor line   (ABOVE the ground line)
+       ▽C棟GL     ← THE GROUND-LINE DATUM (zero)
+       ▼柱型天端  ← top of the COLUMN STUB   ⛔ NOT the foundation top
+       ▼基礎天端  ← top of the FOUNDATION SLAB  ✅ THIS is what top_elevation means
+   When "▼基礎天端" is present you do not have to reason about which dimension is
+   which — the drawing states the level for you:
+     a) SIGN: is ▼基礎天端 drawn BELOW ▽*GL or ABOVE it?
+          BELOW → top_elevation is NEGATIVE (buried — the usual case)
+          ABOVE → top_elevation is POSITIVE (the concrete stands proud of the ground)
+     b) MAGNITUDE, when ▼基礎天端 is BELOW ▽*GL: read the dimension that spans
+        exactly from the ▽*GL line down to the ▼基礎天端 line. If nested chains
+        both cover that gap, take the OUTER (leftmost) total, not its subdivisions.
+          e.g. outer "500" with inner "350" + "150" (350+150=500) → use 500 → -500
+     c) MAGNITUDE, when ▼基礎天端 is ABOVE ▽*GL: these sheets do NOT dimension the
+        ▽GL→天端 gap directly — they dimension both levels from ▽*FL instead. So
+        SUBTRACT:  top_elevation = (▽FL→▽GL) − (▽FL→▼基礎天端)
+          e.g. ▽FL→▽GL = 1,000 and ▽FL→▼基礎天端 = 350 → top_elevation = +650
+        If you cannot read both of those dimensions, set top_elevation = null and
+        let the project default note supply the value. Do NOT guess.
+   ⛔ NEVER use ▼柱型天端 (column-stub top) as top_elevation — it sits ABOVE
+      ▼基礎天端 and would give too small a depth.
+
+STEP A) Find the ▽GL horizontal line in the cross-section drawing (any prefix —
+   ▽GL, ▽SGL, ▽設計GL, ▽C棟GL … are all the same datum; see the ▽*GL note above).
+   ⚠️ Do NOT mistake a ▽*FL (finished floor) line for it — ▽*FL is higher up.
 
 STEP A2) DECIDE THE SIGN FROM WHICH SIDE OF THE ▽GL LINE THE DIMENSION IS DRAWN.
    The ▽GL line is the zero datum, and the chain can run either way from it:
@@ -564,6 +696,11 @@ STEP 6: EXTRACT BOUNDING BOXES (CRITICAL).
     - If multiple types share one drawing (e.g., "F4, F4A 基礎断面"), ALL those types
       share the same bounding box covering the entire combined drawing.
     - Include the title label (e.g., "F1 基礎断面") and the full cross-section area.
+    - LAYOUT B: the block's mini table sits between the title and the drawing —
+      include it, and extend ymax down past the bottom dimension stack (the
+      1,600 / 3,600 / 4,600 lines) so the classification evidence is visible.
+      Stop the box before the NEXT block's title; never let one box cover two
+      foundations (F1A and F3A sit side by side and are separate items).
     - If no cross-section drawing exists for a type, set region to null.
 - For FW Beams (FORMAT A — standalone detail drawings):
     In many Japanese drawing sheets, the beam detail layout is:
@@ -596,10 +733,16 @@ STEP 6: EXTRACT BOUNDING BOXES (CRITICAL).
 - Provide: page number (1-based), ymin, xmin, ymax, xmax (0-1000 scale).
 
 STEP 7: EXTRACT MAIN TABLE REGION (CRITICAL FOR FOUNDATION TABLE IMAGE).
-- You MUST also provide a bounding box for the ENTIRE "Foundation List" table in the `table_region` field.
-- CRITICAL: The table region MUST extend DOWN to include the VERY LAST ROW (e.g., F7, F8, or whatever is the final foundation item).
-- Do NOT cut off the bottom row. Ensure ymax captures the bottom border of the last row.
-- This is separate from individual item regions.
+- LAYOUT A: provide a bounding box for the ENTIRE "Foundation List" table in the
+  `table_region` field.
+  CRITICAL: The table region MUST extend DOWN to include the VERY LAST ROW (e.g., F7,
+  F8, or whatever is the final foundation item).
+  Do NOT cut off the bottom row. Ensure ymax captures the bottom border of the last row.
+- LAYOUT B: there is no single schedule. Set `table_region` to a box covering ALL the
+  per-foundation mini tables on the 基礎リスト sheet (their combined extent), so the
+  preview shows every type/Lx/Ly/D/ベース筋 row at once. If the mini tables are spread
+  over several sheets, use the sheet holding the most of them.
+- Either way this is separate from individual item regions.
 
 STEP 8: DETECT AND HIGHLIGHT OVAL GL MARKERS IN FLOOR AREA.
 
@@ -950,18 +1093,33 @@ Example H — top_elevation runs from ▽GL to the SLAB TOP (two traps):
 Extract the following information for each item:
 1. Type (基礎符号)
 2. Dimensions: Lx, Ly, D. (Fill 0 for beam Lx/Ly if N/A; read D from drawing for beams).
-3. Top Elevation (top_elevation): Distance from ▽GL to top surface in mm, negative if below GL.
+3. Top Elevation (top_elevation): Distance from ▽*GL to top surface in mm, negative if
+   below the ground line, POSITIVE if above it.
 4. Rebar Info: X, Y.
-5. Remarks (備考).
+5. Remarks (備考) — "" when the sheet has no 備考 column (LAYOUT B).
 6. Classification: "DD", "D", "TNF", or "FW/FG" for beams.
+   LAYOUT A → from the 備考 B-formula count.  LAYOUT B → from the bottom
+   dimension-stack count (3/2/1). See STEP 3.
 7. Region: Page, ymin, xmin, ymax, xmax.
 8. Oval GL List: List of detected GL markers with text and region.
+
+⚠️ FINAL REMINDER — the two sheet layouts:
+   • A page-wide 基礎リスト WITH a 備考 column  → LAYOUT A rules.
+   • Per-foundation mini tables, NO 備考 column → LAYOUT B rules: one item per mini
+     table, remarks="", classification from the bottom dimension stack.
+   Never emit an empty foundation_list just because there is no page-wide schedule —
+   look for the per-foundation mini tables instead.
 
 IMPORTANT: Ensure numeric values for Lx and Ly are returned as plain numbers (e.g., 2000), NOT as strings with commas (e.g., "2,000").
 """
 
 SYSTEM_INSTRUCTION = (
     "You are an expert Quantity Surveyor for Japanese construction projects. "
+    "Foundation data comes in TWO sheet layouts and you must handle both: (A) one "
+    "page-wide 基礎リスト with a 備考 column, or (B) a per-foundation mini table under "
+    "each 基礎断面 with no 備考 column — in layout B the classification comes from the "
+    "number of width dimensions stacked under the drawing (3=DD, 2=D, 1=TNF). "
+    "Any ▽*GL prefix (GL, SGL, 設計GL, C棟GL, …) is the same ground-line datum; ▽*FL is not. "
     "Behavior: 1. Extract Foundations from tables. 2. Extract Beams (FW/FG) from detail drawings. "
     "3. Detect Floor Slabs and GL markers. 4. Detect Regular Floors (same elevation GL markers). "
     "5. Detect Sloped Floors (GL markers connected by arrows). "
